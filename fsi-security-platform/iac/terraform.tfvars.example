@@ -1,0 +1,14 @@
+# Copy this file to terraform.tfvars and fill in real values before running terraform apply
+
+aws_region    = "us-east-2"
+key_pair_name = "fsi-workshop-key"   # must already exist in this AWS account/region
+
+# Your workstation's current public IP, in CIDR form (e.g. 68.47.173.14/32)
+# Find yours at: https://checkip.amazonaws.com
+my_ip_cidr = "0.0.0.0/32"
+
+# Look these up fresh each time in EC2 -> Launch Instance -> AMI catalog
+# (search "RHEL-9" / "RHEL-8", owner Red Hat, x86_64, gp3) -- AMI IDs
+# are region-specific and change over time as Red Hat publishes new builds.
+rhel9_ami = "ami-XXXXXXXXXXXXXXXXX"
+rhel8_ami = "ami-XXXXXXXXXXXXXXXXX"

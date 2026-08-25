@@ -1,0 +1,54 @@
+---
+# Assigns your registered core-banking hosts to the right compliance policy
+# based on their RHEL major version. Run after 01-create-compliance-policy.yml.
+- name: Assign hosts to compliance policies
+  hosts: all
+  gather_facts: true
+  vars:
+    satellite_url: "https://ip-10-0-1-135.us-east-2.compute.internal"
+
+  tasks:
+    - name: Determine target policy name for this host
+      ansible.builtin.set_fact:
+        target_policy_name: >-
+          {{ 'fsi-pci-dss-rhel9' if ansible_distribution_major_version == '9' else 'fsi-pci-dss-rhel8' }}
+
+    - name: Look up policy ID by name
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/compliance/policies?search=name%3D%22{{ target_policy_name }}%22"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: policy_lookup
+      delegate_to: localhost
+
+    - name: Fail if policy not found
+      ansible.builtin.fail:
+        msg: "Policy {{ target_policy_name }} not found — run 01-create-compliance-policy.yml first."
+      when: policy_lookup.json.results | length == 0
+
+    - name: Look up this host's Satellite host ID
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/hosts?search=name%3D%22{{ inventory_hostname }}%22"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: host_lookup
+      delegate_to: localhost
+
+    - name: Add host to policy
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/compliance/policies/{{ policy_lookup.json.results[0].id }}/hosts/{{ host_lookup.json.results[0].id }}"
+        method: PUT
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200, 204]
+      when: host_lookup.json.results | length > 0

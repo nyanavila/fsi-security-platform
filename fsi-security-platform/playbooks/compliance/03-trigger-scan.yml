@@ -1,0 +1,46 @@
+---
+# Triggers an immediate OpenSCAP compliance scan on target hosts via Satellite
+# remote execution, rather than waiting for the weekly schedule.
+- name: Trigger OpenSCAP compliance scan
+  hosts: all
+  gather_facts: false
+  vars:
+    satellite_url: "https://ip-10-0-1-135.us-east-2.compute.internal"
+
+  tasks:
+    - name: Look up this host's Satellite host ID
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/hosts?search=name%3D%22{{ inventory_hostname }}%22"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: host_lookup
+      delegate_to: localhost
+
+    - name: Fail if host not found in Satellite
+      ansible.builtin.fail:
+        msg: "{{ inventory_hostname }} not found in Satellite — is it registered?"
+      when: host_lookup.json.results | length == 0
+
+    - name: Run OpenSCAP scan job invocation
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/job_invocations"
+        method: POST
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          job_invocation:
+            feature: "foreman_openscap.run_scans"
+            search_query: "name = {{ inventory_hostname }}"
+        status_code: [200, 201]
+      register: scan_job
+
+    - name: Show scan job status
+      ansible.builtin.debug:
+        msg: "Scan job triggered for {{ inventory_hostname }}: {{ scan_job.json.id | default('see Satellite UI') }}"

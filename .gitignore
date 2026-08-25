@@ -1,0 +1,12 @@
+*.pem
+*.key
+terraform.tfvars
+*.tfstate
+*.tfstate.backup
+.terraform/
+__pycache__/
+*.pyc
+containers-auth.json
+*.log
+/tmp/
+.env

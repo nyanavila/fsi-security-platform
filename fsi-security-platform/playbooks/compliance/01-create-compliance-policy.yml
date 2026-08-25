@@ -1,0 +1,70 @@
+---
+# Creates the FSI PCI-DSS compliance policies in Satellite (one per RHEL major version)
+# Run this once, or whenever policy definitions change.
+- name: Create Satellite compliance policies
+  hosts: localhost
+  gather_facts: false
+  vars:
+    satellite_url: "https://ip-10-0-1-135.us-east-2.compute.internal"
+    # satellite_user / satellite_password should come from AAP credential injection,
+    # not hardcoded here — see README for how the Job Template supplies these.
+
+  tasks:
+    - name: Create RHEL 9 PCI-DSS policy
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/compliance/policies"
+        method: POST
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          policy:
+            name: "fsi-pci-dss-rhel9"
+            description: "FSI core-banking PCI-DSS baseline — RHEL 9"
+            scap_content_id: "{{ scap_content_id_rhel9 }}"
+            scap_content_profile_id: "{{ scap_profile_id_pci_dss_rhel9 }}"
+            deploy_by: "ansible"
+            period: "weekly"
+            weekday: "sunday"
+            hostgroup_ids: []
+        status_code: [200, 201, 422] # 422 = already exists, treat as idempotent
+      register: rhel9_policy
+
+    - name: Create RHEL 8 PCI-DSS policy
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/compliance/policies"
+        method: POST
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          policy:
+            name: "fsi-pci-dss-rhel8"
+            description: "FSI core-banking PCI-DSS baseline — RHEL 8"
+            scap_content_id: "{{ scap_content_id_rhel8 }}"
+            scap_content_profile_id: "{{ scap_profile_id_pci_dss_rhel8 }}"
+            deploy_by: "ansible"
+            period: "weekly"
+            weekday: "sunday"
+            hostgroup_ids: []
+        status_code: [200, 201, 422]
+      register: rhel8_policy
+
+    - name: Show results
+      ansible.builtin.debug:
+        msg:
+          - "RHEL 9 policy: {{ rhel9_policy.status }}"
+          - "RHEL 8 policy: {{ rhel8_policy.status }}"
+
+# NOTE: scap_content_id / scap_profile_id values are Satellite-internal IDs that
+# depend on what SCAP content is loaded (Satellite ships default content on install).
+# Find them via:
+#   GET {{ satellite_url }}/api/compliance/scap_contents
+#   GET {{ satellite_url }}/api/compliance/scap_content_profiles?scap_content_id=<id>
+# and pass as extra_vars, or set defaults below once you've looked them up:
+#   scap_content_id_rhel9: 1
+#   scap_profile_id_pci_dss_rhel9: 12

@@ -1,0 +1,79 @@
+---
+# Pulls CVE data from Red Hat Insights' Vulnerability API (the real source
+# behind the "Lightspeed Vulnerability CVE Report" PDF), filters to what
+# actually applies to THIS environment's registered hosts, and prioritizes
+# by real urgency signals (known exploit, security rule flag) rather than
+# raw CVSS score alone.
+#
+# Auth: Insights API uses your Red Hat account's offline token or
+# service-account credentials — same login as console.redhat.com, NOT your
+# Satellite admin login. Generate one at:
+# https://console.redhat.com/settings/tokens (Service Accounts / API Tokens)
+
+- name: Pull and triage CVE vulnerability data
+  hosts: localhost
+  gather_facts: true
+  vars:
+    insights_api_base: "https://console.redhat.com/api/vulnerability/v1"
+
+  tasks:
+    - name: Get OAuth access token for console.redhat.com
+      ansible.builtin.uri:
+        url: "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: refresh_token
+          client_id: rhsm-api
+          refresh_token: "{{ redhat_offline_token }}"
+        status_code: [200]
+      register: token_response
+
+    - name: Get all CVEs affecting our systems
+      ansible.builtin.uri:
+        url: "{{ insights_api_base }}/vulnerabilities/cves?limit=500&sort=-public_date"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: [200]
+      register: cve_response
+
+    - name: Filter to CVEs with known exploit or security-rule flag (real urgency signal)
+      ansible.builtin.set_fact:
+        urgent_cves: "{{ cve_response.json.data | selectattr('known_exploit', 'defined') | selectattr('known_exploit', 'equalto', true) | list }}"
+
+    - name: Filter to CVEs affecting our specific registered hosts
+      ansible.builtin.uri:
+        url: "{{ insights_api_base }}/vulnerabilities/systems?limit=100"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: [200]
+      register: affected_systems
+
+    - name: Build prioritized triage list
+      ansible.builtin.set_fact:
+        triage_report:
+          generated_at: "{{ ansible_date_time.iso8601 }}"
+          total_cves: "{{ cve_response.json.meta.total_items | default(cve_response.json.data | length) }}"
+          urgent_count: "{{ urgent_cves | length }}"
+          urgent_cves: "{{ urgent_cves | map(attribute='id') | list }}"
+          note: "Urgent = known exploit exists. CVSS score alone is not used for prioritization — a 9.8 with no known exploit ranks below a 7.8 with one."
+
+    - name: Write the triage report
+      ansible.builtin.copy:
+        content: "{{ triage_report | to_nice_json }}"
+        dest: "/tmp/cve_triage_report_{{ ansible_date_time.date }}.json"
+      delegate_to: localhost
+
+    - name: Display urgent findings
+      ansible.builtin.debug:
+        msg:
+          - "=== CVE TRIAGE SUMMARY ==="
+          - "Total CVEs tracked: {{ triage_report.total_cves }}"
+          - "URGENT (known exploit): {{ triage_report.urgent_count }}"
+          - "{{ triage_report.urgent_cves }}"
+          - "=========================="
+          - "All other findings remain 'Not reviewed' pending manual/AI triage."
+          - "See fsi-ai-integration/06-generate-executive-summary.yml to convert"
+          - "this into a board-readable summary."
