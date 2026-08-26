@@ -1,19 +1,28 @@
 ---
-# Applies OpenSCAP's built-in remediation snippets for HIGH severity findings only.
-# Run 04-parse-arf-and-report.yml first — this expects `high_rules` to already be
-# set as a fact (chain these in an AAP Workflow Template, or pass as extra_vars
-# if running standalone with a previously-saved matrix).
+# 05-remediate-high-severity.yml (v2 -- self-sufficient)
 #
-# Safety: this only remediates rules explicitly marked has_snippet=true (meaning
-# OpenSCAP ships a tested fix), and only HIGH severity — medium/low findings are
-# left for manual review by design, since auto-remediating everything blind is
-# not appropriate for an FSI production estate.
-- name: Remediate HIGH severity compliance findings
+# Unlike the original version, this does NOT depend on `high_rules` being
+# set as a fact by a prior job in the same play. It re-fetches and re-parses
+# the latest ARF report itself -- cheap, idempotent, and it means this can
+# run as its own independent AAP Workflow node, with a human Approval Node
+# in between it and the parse step. That's the actual point: a human reviews
+# the rendered remediation matrix from 04, then explicitly approves before
+# this node ever runs -- Tier 4 (human approval) gating Tier 3 (bounded
+# execution), per the Secure Governance Framework.
+#
+# CONFIRMED fixes carried over:
+#   - arf_reports search: policy=<name string>, no last_for=host (broken),
+#     order+per_page=1 instead
+#   - remediation trigger uses the CONFIRMED real feature name
+#     "ansible_run_openscap_remediation" (job_template_id 194)
+#   - input parameter name is "tasks" (confirmed) -- exact list vs. joined-
+#     string format is NOT confirmed, flagged below
+
+- name: Remediate HIGH severity compliance findings (self-sufficient, post-approval)
   hosts: all
-  gather_facts: false
+  gather_facts: true
   vars:
     satellite_url: "https://ip-10-0-1-135.us-east-2.compute.internal"
-    # CUSTOMIZABLE -- see the same note in 04-parse-arf-and-report.yml
     target_policy: >-
       {{
         policy_name
@@ -22,10 +31,70 @@
       }}
 
   tasks:
-    - name: Confirm high_rules fact is available
-      ansible.builtin.fail:
-        msg: "No high_rules fact set — run 04-parse-arf-and-report.yml first in this same play/workflow."
-      when: high_rules is not defined
+    - name: Copy ARF parser script to controller
+      ansible.builtin.copy:
+        src: files/parse_arf.py
+        dest: /tmp/parse_arf.py
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+
+    - name: Query Satellite for latest ARF report
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/compliance/arf_reports?search=host%3D%22{{ inventory_hostname }}%22+and+policy%3D%22{{ target_policy | urlencode }}%22&per_page=1&order=reported+DESC"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: arf_search
+
+    - name: Skip this host if no ARF report found
+      ansible.builtin.meta: end_host
+      when: arf_search.json.results | length == 0
+
+    - name: Set ARF facts
+      ansible.builtin.set_fact:
+        latest_arf_id: "{{ arf_search.json.results[0].id }}"
+
+    - name: Download ARF report bzip2
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/compliance/arf_reports/{{ latest_arf_id }}/download"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+        dest: "/tmp/arf_remediate_{{ inventory_hostname }}_{{ latest_arf_id }}.xml.bz2"
+        status_code: [200]
+      delegate_to: localhost
+
+    - name: Decompress ARF report
+      ansible.builtin.command:
+        cmd: "bunzip2 -f /tmp/arf_remediate_{{ inventory_hostname }}_{{ latest_arf_id }}.xml.bz2"
+      delegate_to: localhost
+      changed_when: true
+
+    - name: Parse ARF XML and extract failed rules with severity
+      ansible.builtin.command:
+        cmd: "python3 /tmp/parse_arf.py /tmp/arf_remediate_{{ inventory_hostname }}_{{ latest_arf_id }}.xml"
+      register: parsed_rules
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Set failed rules and HIGH severity fact
+      ansible.builtin.set_fact:
+        failed_rules: "{{ parsed_rules.stdout | from_json }}"
+
+    - name: Set high_rules fact
+      ansible.builtin.set_fact:
+        high_rules: "{{ failed_rules | selectattr('severity', 'equalto', 'high') | list }}"
+
+    - name: Skip remediation if there are no HIGH severity findings
+      ansible.builtin.meta: end_host
+      when: high_rules | length == 0
 
     - name: Filter to rules with an available automated fix
       ansible.builtin.set_fact:
@@ -33,7 +102,7 @@
 
     - name: Report rules that need manual attention
       ansible.builtin.debug:
-        msg: "MANUAL REVIEW REQUIRED (no automated fix): {{ item.id }} — {{ item.title }}"
+        msg: "MANUAL REVIEW REQUIRED (no automated fix): {{ item.id }} -- {{ item.title }}"
       loop: "{{ high_rules | rejectattr('has_snippet', 'equalto', true) | list }}"
       loop_control:
         label: "{{ item.id }}"
@@ -49,10 +118,11 @@
         body_format: json
         body:
           job_invocation:
-            feature: "foreman_openscap.remediate"
-            inputs:
-              rule_ids: "{{ remediable_rules | map(attribute='id') | list }}"
+            feature: "ansible_run_openscap_remediation"
+            targeting_type: "static_query"
             search_query: "name = {{ inventory_hostname }}"
+            inputs:
+              tasks: "{{ remediable_rules | map(attribute='id') | list }}"
         status_code: [200, 201]
       register: remediation_job
       when: remediable_rules | length > 0
@@ -62,12 +132,12 @@
       ansible.builtin.set_fact:
         remediation_needs_reboot: "{{ remediable_rules | selectattr('needs_reboot', 'equalto', true) | list | length > 0 }}"
 
-    - name: Warn that a reboot will be needed to complete remediation
+    - name: Warn that a reboot will be needed
       ansible.builtin.debug:
-        msg: "WARNING: one or more remediated rules require a reboot to take full effect. Schedule this host for a maintenance-window reboot."
+        msg: "WARNING: one or more remediated rules require a reboot to take full effect."
       when: remediation_needs_reboot | default(false)
 
-    - name: Summary
+    - name: Remediation summary
       ansible.builtin.debug:
         msg:
           - "Host: {{ inventory_hostname }}"
