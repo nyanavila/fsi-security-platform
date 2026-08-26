@@ -1,0 +1,98 @@
+---
+# 00-install-scap-client-prereqs.yml
+#
+# Satellite's own built-in "Run OpenSCAP scans" job template (job_template_id
+# 196) has pre_tasks that install rubygem-foreman_scap_client on RHEL 7, RHEL 8,
+# and CentOS -- but has NO branch for RHEL 9 at all. It just assumes the
+# package is already present via `roles: [scap_client]`, which isn't
+# sufficient on its own.
+#
+# CONFIRMED root cause of "foreman_scap_client: No such file or directory
+# (exit 127)" on all 3 fsi-corebanking-rhel9 hosts, found via direct
+# job_invocation output inspection through the Satellite MCP server.
+#
+# Run this ONCE against any RHEL 9 hostgroup before triggering
+# 03-trigger-scan.yml against it. Mirrors exactly what Satellite's own
+# template already does for RHEL 8, extended to cover RHEL 9.
+
+- name: Install foreman_scap_client and OpenSCAP prerequisites (RHEL 9 gap-fill)
+  hosts: "{{ target_hosts | default('all') }}"
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Enable Satellite Client 6 repo for RHEL 9
+      ansible.builtin.command: >
+        subscription-manager repos
+        --enable="satellite-client-6-for-rhel-9-x86_64-rpms"
+      when:
+        - ansible_distribution == 'RedHat'
+        - ansible_distribution_major_version == '9'
+      register: enable_repo_result
+      changed_when: "'not enabled' in enable_repo_result.stdout or 'enabled' in enable_repo_result.stdout"
+      failed_when: false  # repo may already be enabled from activation key -- don't fail on that
+
+    - name: Install rubygem-foreman_scap_client and OpenSCAP tools on RHEL 9
+      ansible.builtin.dnf:
+        name:
+          - rubygem-foreman_scap_client
+          - openscap-scanner
+          - scap-security-guide
+        state: present
+      when:
+        - ansible_distribution == 'RedHat'
+        - ansible_distribution_major_version == '9'
+      register: install_result
+
+    - name: Confirm foreman_scap_client binary now exists
+      ansible.builtin.stat:
+        path: /usr/bin/foreman_scap_client
+      register: binary_check
+      when:
+        - ansible_distribution == 'RedHat'
+        - ansible_distribution_major_version == '9'
+
+    - name: Fail loudly if the binary still doesn't exist after install
+      ansible.builtin.fail:
+        msg: >-
+          rubygem-foreman_scap_client installed but /usr/bin/foreman_scap_client
+          still not found on {{ inventory_hostname }} -- check the package
+          actually provides this binary path on this OS version, or check for
+          a repo/entitlement issue.
+      when:
+        - ansible_distribution == 'RedHat'
+        - ansible_distribution_major_version == '9'
+        - not binary_check.stat.exists
+
+    - name: Confirm success
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: foreman_scap_client ready at /usr/bin/foreman_scap_client"
+      when:
+        - ansible_distribution == 'RedHat'
+        - ansible_distribution_major_version == '9'
+        - binary_check.stat.exists
+
+    # RHEL 8 hosts already get this from Satellite's own built-in template
+    # when the scan job runs -- but installing it here too is harmless and
+    # makes this playbook a genuine "run this on any hostgroup before
+    # scanning" prerequisite, not just an RHEL-9-specific patch.
+    - name: Enable Satellite Client 6 repo for RHEL 8 (belt-and-suspenders)
+      ansible.builtin.command: >
+        subscription-manager repos
+        --enable="satellite-client-6-for-rhel-8-x86_64-rpms"
+      when:
+        - ansible_distribution == 'RedHat'
+        - ansible_distribution_major_version == '8'
+      failed_when: false
+      changed_when: false
+
+    - name: Install rubygem-foreman_scap_client on RHEL 8 (belt-and-suspenders)
+      ansible.builtin.yum:
+        name:
+          - rubygem-foreman_scap_client
+          - openscap-scanner
+          - scap-security-guide
+        state: present
+      when:
+        - ansible_distribution == 'RedHat'
+        - ansible_distribution_major_version == '8'
