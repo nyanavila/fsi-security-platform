@@ -27,9 +27,35 @@
       delegate_to: localhost
       run_once: true
 
-    - name: Query Satellite for latest ARF report
+    - name: Look up the numeric policy ID for the target policy name
       ansible.builtin.uri:
-        url: "{{ satellite_url }}/api/compliance/arf_reports?search=host%3D%22{{ inventory_hostname }}%22+and+policy%3D%22{{ target_policy | urlencode }}%22+and+last_for%3Dhost&per_page=1&order=reported+DESC"
+        url: "{{ satellite_url }}/api/compliance/policies?search=name%3D%22{{ target_policy | urlencode }}%22"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: policy_lookup
+      delegate_to: localhost
+
+    - name: Fail if the policy doesn't exist
+      ansible.builtin.fail:
+        msg: "Policy '{{ target_policy }}' not found in Satellite."
+      when: policy_lookup.json.results | length == 0
+
+    - name: Set the policy id fact
+      ansible.builtin.set_fact:
+        target_policy_id: "{{ policy_lookup.json.results[0].id }}"
+
+    - name: Query Satellite for latest ARF report
+      # CONFIRMED via direct API testing: policy= needs the numeric policy ID,
+      # not the policy name string -- searching by name silently returns zero
+      # results. last_for=host is also confirmed broken/unreliable on this
+      # Satellite version -- dropped in favor of order+per_page=1, which
+      # achieves the same "most recent report" result correctly.
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/compliance/arf_reports?search=host%3D%22{{ inventory_hostname }}%22+and+policy_id%3D{{ target_policy_id }}&per_page=1&order=reported+DESC"
         method: GET
         user: "{{ satellite_user }}"
         password: "{{ satellite_password }}"
