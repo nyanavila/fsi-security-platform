@@ -20,7 +20,8 @@
   hosts: localhost
   gather_facts: false
   vars:
-    satellite_url: "{{ satellite_url | default('https://ip-10-0-1-135.us-east-2.compute.internal') }}"
+    ##satellite_url: "{{ satellite_url | default('https://ip-10-0-1-135.us-east-2.compute.internal') }}"
+    satellite_url: "https://ip-10-0-1-135.us-east-2.compute.internal"
 
     # --- Customize these per policy you want to create ---
     # policy_name:              e.g. "fsi-pci-dss-rhel9"  (REQUIRED, no default --
