@@ -15,7 +15,8 @@
   hosts: localhost
   gather_facts: false
   vars:
-    satellite_url: "{{ satellite_url | default('https://ip-10-0-1-135.us-east-2.compute.internal') }}"
+    ##satellite_url: "{{ satellite_url | default('https://ip-10-0-1-135.us-east-2.compute.internal') }}"
+    satellite_url: "https://ip-10-0-1-135.us-east-2.compute.internal"
     # target_search: a Satellite host search string, e.g.:
     #   'hostgroup = fsi-corebanking-rhel9'
     #   'name = core-banking-ledger-01'
