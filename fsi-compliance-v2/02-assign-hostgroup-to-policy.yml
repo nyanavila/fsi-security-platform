@@ -89,12 +89,23 @@
         status_code: [200]
       register: attach_result
 
+    - name: Re-fetch the policy to confirm the change actually took
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/compliance/policies/{{ policy_id }}"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: policy_recheck
+
     - name: Confirm
       ansible.builtin.debug:
         msg: >-
           Policy '{{ policy_name }}' (id {{ policy_id }}) now includes
           hostgroup '{{ hostgroup_name }}' (id {{ hostgroup_id }}).
-          Full hostgroup list on policy: {{ attach_result.json.hostgroups | map(attribute='name') | list }}
+          Full hostgroup list on policy: {{ policy_recheck.json.hostgroups | default([]) | map(attribute='name') | list }}
 
     - name: Reminder about actual host membership
       ansible.builtin.debug:
