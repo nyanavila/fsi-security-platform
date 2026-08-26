@@ -1,0 +1,221 @@
+---
+# 06-verify-remediation.yml
+#
+# Runs AFTER 05-remediate-high-severity.yml. Re-triggers a fresh scan,
+# waits for it, re-parses the new ARF report per host, and combines
+# everything into ONE fleet-wide JSON deliverable proving before/after
+# remediation status -- the actual proof artifact for the workflow.
+#
+# Three plays in this one file, in order:
+#   1. Trigger the rescan (localhost, API call)
+#   2. Per-host: wait, re-parse post-remediation ARF, write per-host JSON
+#   3. Combine all per-host JSON files into one fleet-wide deliverable
+
+- name: Trigger a fresh rescan to verify remediation
+  hosts: localhost
+  gather_facts: false
+  vars:
+    satellite_url: "https://ip-10-0-1-135.us-east-2.compute.internal"
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - target_search is defined
+        fail_msg: "This playbook needs: target_search (e.g. 'hostgroup = fsi-corebanking-rhel9')"
+
+    - name: Trigger the rescan
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/job_invocations"
+        method: POST
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          job_invocation:
+            feature: "foreman_openscap_run_scans"
+            targeting_type: "static_query"
+            search_query: "{{ target_search }}"
+        status_code: [200, 201]
+      register: rescan_job
+
+    - name: Confirm rescan triggered
+      ansible.builtin.debug:
+        msg: >-
+          Rescan triggered, job invocation id: {{ rescan_job.json.id }}.
+          Waiting {{ rescan_wait_seconds | default(180) }} seconds for it
+          to complete before re-parsing results.
+
+    - name: Wait for scan to complete
+      ansible.builtin.pause:
+        seconds: "{{ rescan_wait_seconds | default(180) }}"
+
+- name: Re-parse post-remediation ARF results and write per-host JSON
+  hosts: all
+  gather_facts: true
+  vars:
+    satellite_url: "https://ip-10-0-1-135.us-east-2.compute.internal"
+    target_policy: >-
+      {{
+        policy_name
+        if policy_name is defined
+        else ('fsi-pci-dss-rhel9' if ansible_distribution_major_version == '9' else 'fsi-pci-dss-rhel8')
+      }}
+
+  tasks:
+    - name: Copy ARF parser script to controller
+      ansible.builtin.copy:
+        src: files/parse_arf.py
+        dest: /tmp/parse_arf.py
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+
+    - name: Query Satellite for the latest (post-remediation) ARF report
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/compliance/arf_reports?search=host%3D%22{{ inventory_hostname }}%22+and+policy%3D%22{{ target_policy | urlencode }}%22&per_page=2&order=reported+DESC"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: arf_search
+
+    - name: Skip this host if no ARF report found
+      ansible.builtin.meta: end_host
+      when: arf_search.json.results | length == 0
+
+    - name: Set post- and pre-remediation ARF facts from the same query
+      # per_page=2 + order DESC gets the newest (post-remediation) report
+      # at index 0 and the one before it (pre-remediation) at index 1 in
+      # a single API call, instead of two separate lookups.
+      ansible.builtin.set_fact:
+        post_arf_id: "{{ arf_search.json.results[0].id }}"
+        post_passed: "{{ arf_search.json.results[0].passed | default(0) }}"
+        post_failed: "{{ arf_search.json.results[0].failed | default(0) }}"
+        post_reported_at: "{{ arf_search.json.results[0].reported }}"
+        pre_failed: "{{ arf_search.json.results[1].failed | default('unknown') if arf_search.json.results | length > 1 else 'unknown' }}"
+        pre_passed: "{{ arf_search.json.results[1].passed | default('unknown') if arf_search.json.results | length > 1 else 'unknown' }}"
+
+    - name: Download post-remediation ARF report
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/compliance/arf_reports/{{ post_arf_id }}/download"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+        dest: "/tmp/arf_verify_{{ inventory_hostname }}_{{ post_arf_id }}.xml.bz2"
+        status_code: [200]
+      delegate_to: localhost
+
+    - name: Decompress
+      ansible.builtin.command:
+        cmd: "bunzip2 -f /tmp/arf_verify_{{ inventory_hostname }}_{{ post_arf_id }}.xml.bz2"
+      delegate_to: localhost
+      changed_when: true
+
+    - name: Parse the post-remediation ARF XML
+      ansible.builtin.command:
+        cmd: "python3 /tmp/parse_arf.py /tmp/arf_verify_{{ inventory_hostname }}_{{ post_arf_id }}.xml"
+      register: parsed_post_rules
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Set post-remediation failed/high rules facts
+      ansible.builtin.set_fact:
+        post_failed_rules: "{{ parsed_post_rules.stdout | from_json }}"
+
+    - name: Set post-remediation HIGH severity fact
+      ansible.builtin.set_fact:
+        post_high_rules: "{{ post_failed_rules | selectattr('severity', 'equalto', 'high') | list }}"
+
+    - name: Build the JSON verification report for this host
+      ansible.builtin.set_fact:
+        host_verification_report:
+          host: "{{ inventory_hostname }}"
+          policy: "{{ target_policy }}"
+          verified_at: "{{ ansible_date_time.iso8601 }}"
+          pre_remediation:
+            passed: "{{ pre_passed }}"
+            failed: "{{ pre_failed }}"
+          post_remediation:
+            passed: "{{ post_passed }}"
+            failed: "{{ post_failed }}"
+            reported_at: "{{ post_reported_at }}"
+            high_severity_remaining: "{{ post_high_rules | length }}"
+            high_severity_remaining_ids: "{{ post_high_rules | map(attribute='id') | list }}"
+          remediation_status: >-
+            {{
+              'ALL_HIGH_SEVERITY_RESOLVED'
+              if post_high_rules | length == 0
+              else 'HIGH_SEVERITY_FINDINGS_REMAIN'
+            }}
+
+    - name: Write per-host JSON verification report
+      ansible.builtin.copy:
+        content: "{{ host_verification_report | to_nice_json }}"
+        dest: "/tmp/verification_report_{{ inventory_hostname }}_{{ ansible_date_time.date }}.json"
+      delegate_to: localhost
+
+    - name: Display verification summary
+      ansible.builtin.debug:
+        msg:
+          - "HOST: {{ inventory_hostname }}"
+          - "STATUS: {{ host_verification_report.remediation_status }}"
+          - "Failed (pre -> post): {{ pre_failed }} -> {{ post_failed }}"
+          - "HIGH severity remaining: {{ post_high_rules | length }}"
+
+- name: Combine all per-host reports into one fleet-wide JSON deliverable
+  hosts: localhost
+  gather_facts: true
+  vars:
+    all_reports: []
+
+  tasks:
+    - name: Find all per-host verification reports from today's run
+      ansible.builtin.find:
+        paths: /tmp
+        patterns: "verification_report_*_{{ ansible_date_time.date }}.json"
+      register: report_files
+
+    - name: Load each per-host report
+      ansible.builtin.set_fact:
+        all_reports: "{{ all_reports + [ (lookup('file', item.path) | from_json) ] }}"
+      loop: "{{ report_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Build the fleet-wide summary
+      ansible.builtin.set_fact:
+        fleet_summary:
+          generated_at: "{{ ansible_date_time.iso8601 }}"
+          total_hosts_checked: "{{ all_reports | length }}"
+          hosts_fully_remediated: "{{ all_reports | selectattr('remediation_status', 'equalto', 'ALL_HIGH_SEVERITY_RESOLVED') | list | length }}"
+          hosts_with_remaining_findings: "{{ all_reports | selectattr('remediation_status', 'equalto', 'HIGH_SEVERITY_FINDINGS_REMAIN') | list | length }}"
+          overall_status: >-
+            {{
+              'SUCCESS -- ALL HIGH SEVERITY FINDINGS REMEDIATED FLEET-WIDE'
+              if (all_reports | selectattr('remediation_status', 'equalto', 'HIGH_SEVERITY_FINDINGS_REMAIN') | list | length) == 0
+              else 'PARTIAL -- SOME HOSTS STILL HAVE HIGH SEVERITY FINDINGS'
+            }}
+          hosts: "{{ all_reports }}"
+
+    - name: Write the final fleet-wide JSON deliverable
+      ansible.builtin.copy:
+        content: "{{ fleet_summary | to_nice_json }}"
+        dest: "/tmp/fsi_compliance_remediation_deliverable_{{ ansible_date_time.date }}.json"
+
+    - name: Display the final deliverable summary
+      ansible.builtin.debug:
+        msg:
+          - "=== FLEET-WIDE REMEDIATION VERIFICATION ==="
+          - "{{ fleet_summary.overall_status }}"
+          - "Hosts checked: {{ fleet_summary.total_hosts_checked }}"
+          - "Fully remediated: {{ fleet_summary.hosts_fully_remediated }}"
+          - "Still have findings: {{ fleet_summary.hosts_with_remaining_findings }}"
+          - "Full JSON deliverable: /tmp/fsi_compliance_remediation_deliverable_{{ ansible_date_time.date }}.json"
