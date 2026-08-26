@@ -73,7 +73,7 @@
         hostgroup_id: "{{ hostgroup_lookup.json.results[0].id }}"
         # Preserve any hostgroups already attached, don't clobber them
         existing_hostgroup_ids: "{{ policy_lookup.json.results[0].hostgroups | default([]) | map(attribute='id') | list }}"
-
+        
     - name: Attach the hostgroup to the policy (additive, not destructive)
       ansible.builtin.uri:
         url: "{{ satellite_url }}/api/compliance/policies/{{ policy_id }}"
@@ -85,9 +85,11 @@
         body_format: json
         body:
           policy:
-            hostgroup_ids: "{{ (existing_hostgroup_ids + [hostgroup_id]) | unique }}"
+            hostgroup_ids: "{{ (existing_hostgroup_ids | map('int') | list + [hostgroup_id | int]) | unique }}"
         status_code: [200]
       register: attach_result
+
+    
 
     - name: Re-fetch the policy to confirm the change actually took
       ansible.builtin.uri:
