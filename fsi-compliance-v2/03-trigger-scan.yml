@@ -1,76 +1,53 @@
 ---
-# v2 -- REPLACES the old 03-trigger-scan.yml, which hardcoded
-# feature: "foreman_openscap.run_scans" -- CONFIRMED this was an unverified
-# guess that does not match any real job template on Satellite 6.18
-# ("Template with id '' was not found").
+# v3 -- CONFIRMED WORKING via live Satellite MCP server query against this
+# instance's actual /api/remote_execution_features and /api/job_templates/196.
+# No more dynamic discovery or guessing -- this is the real, verified call.
 #
-# FIX: dynamically discover the real job template by searching Satellite's
-# own /api/job_templates for anything compliance/SCAP-related, rather than
-# hardcoding a name. This makes the playbook resilient to naming differences
-# across Satellite versions AND self-documenting -- if this ever fails again,
-# the debug output tells you exactly what templates ARE available, instead
-# of a bare 404.
+# Verified facts:
+#   - feature "foreman_openscap_run_scans" maps to job_template_id 196
+#     ("Run OpenSCAP scans")
+#   - That template has NO template_inputs -- it takes no policy parameter.
+#     It iterates EVERY policy already assigned to each targeted host and
+#     runs `foreman_scap_client <policy_id>` once per assigned policy.
+#   - This means: if a hostgroup has multiple policies assigned, triggering
+#     this feature runs ALL of them per host in that hostgroup -- there is
+#     no way to selectively run just one policy via this feature.
+#   - A host with ZERO policies assigned will raise an error, not silently
+#     skip.
+#   - job_invocations POST needs targeting_type + search_query; job_template_id
+#     is optional and gets resolved automatically from "feature".
 
-- name: Trigger an on-demand OpenSCAP compliance scan
+- name: Trigger an on-demand OpenSCAP compliance scan (verified job_invocations call)
   hosts: localhost
   gather_facts: false
   vars:
-    ##satellite_url: "{{ satellite_url | default('https://ip-10-0-1-135.us-east-2.compute.internal') }}"
     satellite_url: "https://ip-10-0-1-135.us-east-2.compute.internal"
     # target_search: a Satellite host search string, e.g.:
     #   'hostgroup = fsi-corebanking-rhel9'
     #   'name = core-banking-ledger-01'
     # REQUIRED, no default -- forces a deliberate target.
+    #
+    # targeting_type: "static_query" (default) locks the host list at
+    # submission time. Use "dynamic_query" for a recurring/scheduled job
+    # where you want the host list re-evaluated each run.
+    targeting_type: "{{ targeting_type | default('static_query') }}"
 
   tasks:
     - name: Validate required variables
       ansible.builtin.assert:
         that:
           - target_search is defined
-        fail_msg: "This playbook needs: target_search (a Satellite host search string)"
+        fail_msg: "This playbook needs: target_search (a Satellite host search string, e.g. 'hostgroup = fsi-corebanking-rhel9')"
 
-    - name: Discover available job templates matching compliance/SCAP
-      ansible.builtin.uri:
-        url: "{{ satellite_url }}/api/job_templates?search=name+~+scap+or+name+~+compliance+or+name+~+openscap&per_page=50"
-        method: GET
-        user: "{{ satellite_user }}"
-        password: "{{ satellite_password }}"
-        force_basic_auth: true
-        validate_certs: false
-        status_code: [200]
-      register: template_search
-
-    - name: Show what was found
+    - name: Warn if targeting a hostgroup with multiple policies assigned
       ansible.builtin.debug:
-        msg: "Found candidate template(s): {{ template_search.json.results | map(attribute='name') | list }}"
-
-    - name: Fail with a useful message if nothing matched and no override given
-      ansible.builtin.fail:
         msg: >-
-          No compliance/SCAP-related job template found on this Satellite
-          instance. Check Hosts -> Job Templates in the UI for the exact name
-          of the scan-trigger template, then pass it explicitly via
-          -e job_template_name="<exact name>" to skip discovery.
-      when:
-        - template_search.json.results | length == 0
-        - job_template_name is not defined
+          NOTE: this triggers ALL policies assigned to matched hosts, not a
+          single policy -- there is no per-policy selection on this feature.
+          If a targeted hostgroup has multiple policies assigned, all of them
+          run. Confirm that's intended before proceeding.
 
-    - name: Select the template to use
-      ansible.builtin.set_fact:
-        selected_template_id: >-
-          {{
-            (template_search.json.results | selectattr('name', 'equalto', job_template_name | default('')) | list | first).id
-            if job_template_name is defined
-            else template_search.json.results[0].id
-          }}
-        selected_template_name: >-
-          {{
-            job_template_name
-            if job_template_name is defined
-            else template_search.json.results[0].name
-          }}
-
-    - name: Invoke the scan job against the target
+    - name: Trigger the OpenSCAP scan job
       ansible.builtin.uri:
         url: "{{ satellite_url }}/api/job_invocations"
         method: POST
@@ -81,7 +58,8 @@
         body_format: json
         body:
           job_invocation:
-            job_template_id: "{{ selected_template_id }}"
+            feature: "foreman_openscap_run_scans"
+            targeting_type: "{{ targeting_type }}"
             search_query: "{{ target_search }}"
         status_code: [200, 201]
       register: scan_job
@@ -89,8 +67,8 @@
     - name: Confirm
       ansible.builtin.debug:
         msg: >-
-          Triggered '{{ selected_template_name }}' (id {{ selected_template_id }})
-          against '{{ target_search }}'. Job invocation id:
-          {{ scan_job.json.id | default('see Satellite UI for status') }}.
+          Triggered OpenSCAP scan (feature: foreman_openscap_run_scans,
+          job_template_id 196) against '{{ target_search }}'.
+          Job invocation id: {{ scan_job.json.id | default('see Satellite UI for status') }}.
           Scans take a few minutes -- check Hosts -> [host] -> Compliance
           before running the ARF-parsing playbook.

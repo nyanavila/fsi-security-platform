@@ -12,7 +12,7 @@
   hosts: all
   gather_facts: false
   vars:
-    satellite_url: "{{ satellite_url | default('https://ip-10-0-1-135.us-east-2.compute.internal') }}"
+    satellite_url: "https://ip-10-0-1-135.us-east-2.compute.internal"
     # CUSTOMIZABLE -- see the same note in 04-parse-arf-and-report.yml
     target_policy: >-
       {{

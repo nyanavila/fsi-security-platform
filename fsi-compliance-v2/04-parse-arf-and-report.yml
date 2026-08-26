@@ -3,7 +3,7 @@
   hosts: all
   gather_facts: true
   vars:
-    satellite_url: "{{ satellite_url | default('https://ip-10-0-1-135.us-east-2.compute.internal') }}"
+    satellite_url: "https://ip-10-0-1-135.us-east-2.compute.internal"
     # CUSTOMIZABLE: pass policy_name explicitly (e.g. -e policy_name=fsi-pci-dss-rhel9)
     # rather than relying on OS-version auto-detection -- this lets you run
     # CIS, HIPAA, or any other policy against any host without editing the
