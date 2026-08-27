@@ -34,19 +34,59 @@
           - errata_severity_filter is defined
         fail_msg: "This playbook needs: errata_severity_filter (e.g. 'critical,important')"
 
-    - name: Read this host's errata check report (must have run 07 first)
-      ansible.builtin.set_fact:
-        errata_report: "{{ lookup('file', '/tmp/errata_check_' + inventory_hostname + '.json') | from_json }}"
+    - name: Look up this host's Satellite host ID
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/hosts?search=name%3D%22{{ inventory_hostname }}%22"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: host_lookup
       delegate_to: localhost
+
+    - name: Skip if host not found in Satellite
+      ansible.builtin.meta: end_host
+      when: host_lookup.json.results | length == 0
+
+    - name: Set the host id fact
+      ansible.builtin.set_fact:
+        satellite_host_id: "{{ host_lookup.json.results[0].id }}"
+
+    - name: Re-query applicable errata directly (self-sufficient -- does NOT
+        depend on 07's output file, since AAP job runs are ephemeral
+        containers and files don't persist between separate job launches)
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/hosts/{{ satellite_host_id }}/errata"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: errata_result
+
+    - name: Set errata facts, categorized by severity
+      ansible.builtin.set_fact:
+        all_errata: "{{ errata_result.json.results | default([]) }}"
+        security_errata: "{{ errata_result.json.results | default([]) | selectattr('type', 'equalto', 'security') | list }}"
+
+    - name: Categorise SECURITY errata by severity level
+      ansible.builtin.set_fact:
+        critical_errata_ids: "{{ security_errata | selectattr('severity', 'equalto', 'Critical') | map(attribute='errata_id') | list }}"
+        important_errata_ids: "{{ security_errata | selectattr('severity', 'equalto', 'Important') | map(attribute='errata_id') | list }}"
+        moderate_errata_ids: "{{ security_errata | selectattr('severity', 'equalto', 'Moderate') | map(attribute='errata_id') | list }}"
+        low_errata_ids: "{{ security_errata | selectattr('severity', 'equalto', 'Low') | map(attribute='errata_id') | list }}"
 
     - name: Build the list of advisory IDs to apply, based on the approved severity tiers
       ansible.builtin.set_fact:
         advisories_to_apply: >-
           {{
-            (errata_report.critical_errata_ids if 'critical' in errata_severity_filter.split(',') else [])
-            + (errata_report.important_errata_ids if 'important' in errata_severity_filter.split(',') else [])
-            + (errata_report.moderate_errata_ids if 'moderate' in errata_severity_filter.split(',') else [])
-            + (errata_report.low_errata_ids if 'low' in errata_severity_filter.split(',') else [])
+            (critical_errata_ids if 'critical' in errata_severity_filter.split(',') else [])
+            + (important_errata_ids if 'important' in errata_severity_filter.split(',') else [])
+            + (moderate_errata_ids if 'moderate' in errata_severity_filter.split(',') else [])
+            + (low_errata_ids if 'low' in errata_severity_filter.split(',') else [])
           }}
 
     - name: Skip if nothing to apply
