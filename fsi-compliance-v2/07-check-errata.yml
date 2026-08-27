@@ -1,0 +1,90 @@
+---
+# 07-check-errata.yml
+#
+# Tier 1 (read-only). Queries Satellite for applicable errata on a host or
+# hostgroup, categorizes by severity, and shows which advisories exist --
+# does NOT install anything. This is Stage 2's "Detect" step from the
+# three-stage lifecycle design, run manually/on-demand for now; the EDA
+# rulebook (not yet built) will eventually trigger this automatically.
+
+- name: Check applicable errata for a host or hostgroup
+  hosts: all
+  gather_facts: false
+  vars:
+    satellite_url: "https://ip-10-0-1-135.us-east-2.compute.internal"
+
+  tasks:
+    - name: Look up this host's Satellite host ID
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/hosts?search=name%3D%22{{ inventory_hostname }}%22"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: host_lookup
+      delegate_to: localhost
+
+    - name: Skip if host not found in Satellite
+      ansible.builtin.meta: end_host
+      when: host_lookup.json.results | length == 0
+
+    - name: Set the host id fact
+      ansible.builtin.set_fact:
+        satellite_host_id: "{{ host_lookup.json.results[0].id }}"
+
+    - name: Query applicable errata for this host
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/hosts/{{ satellite_host_id }}/errata"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: errata_result
+
+    - name: Set errata facts, categorized by severity
+      ansible.builtin.set_fact:
+        all_errata: "{{ errata_result.json.results | default([]) }}"
+
+    - name: Categorise errata by type/severity
+      ansible.builtin.set_fact:
+        security_errata: "{{ all_errata | selectattr('type', 'equalto', 'security') | list }}"
+        bugfix_errata: "{{ all_errata | selectattr('type', 'equalto', 'bugfix') | list }}"
+        enhancement_errata: "{{ all_errata | selectattr('type', 'equalto', 'enhancement') | list }}"
+
+    - name: Categorise SECURITY errata further by severity level
+      ansible.builtin.set_fact:
+        critical_errata: "{{ security_errata | selectattr('severity', 'equalto', 'Critical') | list }}"
+        important_errata: "{{ security_errata | selectattr('severity', 'equalto', 'Important') | list }}"
+        moderate_errata: "{{ security_errata | selectattr('severity', 'equalto', 'Moderate') | list }}"
+        low_errata: "{{ security_errata | selectattr('severity', 'equalto', 'Low') | list }}"
+
+    - name: Display summary
+      ansible.builtin.debug:
+        msg:
+          - "HOST: {{ inventory_hostname }}"
+          - "Total applicable errata: {{ all_errata | length }}"
+          - "Security errata: {{ security_errata | length }} (Critical: {{ critical_errata | length }}, Important: {{ important_errata | length }}, Moderate: {{ moderate_errata | length }}, Low: {{ low_errata | length }})"
+          - "Bugfix errata: {{ bugfix_errata | length }}"
+          - "Enhancement errata: {{ enhancement_errata | length }}"
+          - "Critical/Important advisory IDs: {{ (critical_errata + important_errata) | map(attribute='errata_id') | list }}"
+
+    - name: Write per-host errata report (JSON, for downstream use by 08/EDA)
+      ansible.builtin.copy:
+        content: >-
+          {{
+            {
+              'host': inventory_hostname,
+              'satellite_host_id': satellite_host_id,
+              'total_errata': all_errata | length,
+              'critical_errata_ids': critical_errata | map(attribute='errata_id') | list,
+              'important_errata_ids': important_errata | map(attribute='errata_id') | list,
+              'moderate_errata_ids': moderate_errata | map(attribute='errata_id') | list,
+              'low_errata_ids': low_errata | map(attribute='errata_id') | list
+            } | to_nice_json
+          }}
+        dest: "/tmp/errata_check_{{ inventory_hostname }}.json"
+      delegate_to: localhost
