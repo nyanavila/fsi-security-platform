@@ -1,0 +1,85 @@
+---
+# 08-apply-errata.yml
+#
+# Tier 3 (bounded execution). Applies specific errata via Satellite's
+# confirmed katello_errata_install feature (job_template_id 206).
+#
+# CONFIRMED input format (verified live against the actual template body,
+# not guessed): a SINGLE comma-separated STRING of advisory IDs -- e.g.
+# "RHSA-2024:1234,RHBA-2024:5678" -- NOT a JSON list, NOT CVE numbers.
+# The template does `input(:errata).split(',').map {|e| "--advisory=#{e}"}`
+# then runs `dnf update-minimal --advisory=<ids>`. Passing a JSON array or
+# CVE numbers here would silently fail or do nothing useful.
+#
+# This playbook is designed to run AFTER 07-check-errata.yml has produced
+# /tmp/errata_check_<host>.json, and after a human/EDA decision about which
+# severity tier to act on (per the three-stage lifecycle design's approval
+# branching). It does NOT decide policy itself -- it takes an explicit
+# errata_severity_filter var telling it which tier to apply.
+
+- name: Apply specific errata to a host (post-approval, Tier 3)
+  hosts: all
+  gather_facts: false
+  vars:
+    satellite_url: "https://ip-10-0-1-135.us-east-2.compute.internal"
+    # errata_severity_filter: which severity tier(s) to apply from the
+    # 07 report -- e.g. "critical,important" or just "low". REQUIRED.
+    # This is the human/EDA approval decision made concrete as an input,
+    # not something this playbook decides on its own.
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - errata_severity_filter is defined
+        fail_msg: "This playbook needs: errata_severity_filter (e.g. 'critical,important')"
+
+    - name: Read this host's errata check report (must have run 07 first)
+      ansible.builtin.set_fact:
+        errata_report: "{{ lookup('file', '/tmp/errata_check_' + inventory_hostname + '.json') | from_json }}"
+      delegate_to: localhost
+
+    - name: Build the list of advisory IDs to apply, based on the approved severity tiers
+      ansible.builtin.set_fact:
+        advisories_to_apply: >-
+          {{
+            (errata_report.critical_errata_ids if 'critical' in errata_severity_filter.split(',') else [])
+            + (errata_report.important_errata_ids if 'important' in errata_severity_filter.split(',') else [])
+            + (errata_report.moderate_errata_ids if 'moderate' in errata_severity_filter.split(',') else [])
+            + (errata_report.low_errata_ids if 'low' in errata_severity_filter.split(',') else [])
+          }}
+
+    - name: Skip if nothing to apply
+      ansible.builtin.meta: end_host
+      when: advisories_to_apply | length == 0
+
+    - name: Show what's about to be applied
+      ansible.builtin.debug:
+        msg: "About to apply {{ advisories_to_apply | length }} advisories to {{ inventory_hostname }}: {{ advisories_to_apply }}"
+
+    - name: Trigger errata installation via Satellite (CONFIRMED feature + input format)
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/job_invocations"
+        method: POST
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          job_invocation:
+            feature: "katello_errata_install"
+            targeting_type: "static_query"
+            search_query: "name = {{ inventory_hostname }}"
+            inputs:
+              errata: "{{ advisories_to_apply | join(',') }}"
+        status_code: [200, 201]
+      register: errata_job
+
+    - name: Confirm
+      ansible.builtin.debug:
+        msg: >-
+          Triggered errata install (feature: katello_errata_install,
+          job_template_id 206) against {{ inventory_hostname }} for
+          advisories: {{ advisories_to_apply | join(',') }}.
+          Job invocation id: {{ errata_job.json.id | default('see Satellite UI') }}
