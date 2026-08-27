@@ -96,7 +96,7 @@
         post_arf_id: "{{ arf_search.json.results[0].id }}"
         post_passed: "{{ arf_search.json.results[0].passed | default(0) }}"
         post_failed: "{{ arf_search.json.results[0].failed | default(0) }}"
-        post_reported_at: "{{ arf_search.json.results[0].reported }}"
+        post_reported_at: "{{ arf_search.json.results[0].reported | default(arf_search.json.results[0].reported_at) | default('unknown') }}"
         pre_failed: "{{ arf_search.json.results[1].failed | default('unknown') if arf_search.json.results | length > 1 else 'unknown' }}"
         pre_passed: "{{ arf_search.json.results[1].passed | default('unknown') if arf_search.json.results | length > 1 else 'unknown' }}"
 
