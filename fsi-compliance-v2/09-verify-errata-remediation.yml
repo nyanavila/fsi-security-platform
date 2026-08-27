@@ -1,0 +1,151 @@
+---
+# 09-verify-errata-remediation.yml
+#
+# Errata equivalent of 06-verify-remediation.yml. Re-checks applicable
+# errata per host after 08-apply-errata.yml ran, and produces a fleet-wide
+# JSON deliverable proving which advisories were resolved.
+#
+# Does NOT trigger a rescan (unlike 06) -- errata applicability in Satellite
+# updates as soon as the package database refreshes post-install, no
+# separate OpenSCAP-style scan job is needed. Just re-query and compare.
+#
+# Usage: pass the SAME errata_severity_filter and the same advisory list
+# you applied in 08, OR simply pass previously_applied_errata as an explicit
+# comma-separated list (safer -- avoids re-deriving "what severity tier did
+# we apply" from scratch, since severity buckets can shift between runs as
+# new advisories appear, per the real finding just confirmed today).
+
+- name: Verify errata remediation per host
+  hosts: all
+  gather_facts: false
+  vars:
+    satellite_url: "https://ip-10-0-1-135.us-east-2.compute.internal"
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - previously_applied_errata is defined
+        fail_msg: >-
+          This playbook needs: previously_applied_errata (comma-separated
+          advisory IDs that were applied in 08, e.g.
+          "RHSA-2026:56133,RHSA-2026:56131")
+
+    - name: Look up this host's Satellite host ID
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/hosts?search=name%3D%22{{ inventory_hostname }}%22"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: host_lookup
+      delegate_to: localhost
+
+    - name: Skip if host not found
+      ansible.builtin.meta: end_host
+      when: host_lookup.json.results | length == 0
+
+    - name: Re-query current applicable errata
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/hosts/{{ host_lookup.json.results[0].id }}/errata"
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200]
+      register: current_errata
+
+    - name: Set current applicable IDs as a fact
+      ansible.builtin.set_fact:
+        current_errata_ids: "{{ current_errata.json.results | default([]) | map(attribute='errata_id') | list }}"
+        applied_list: "{{ previously_applied_errata.split(',') }}"
+
+    - name: Determine which applied advisories are confirmed resolved vs still present
+      ansible.builtin.set_fact:
+        resolved_errata: "{{ applied_list | reject('in', current_errata_ids) | list }}"
+        still_applicable_errata: "{{ applied_list | select('in', current_errata_ids) | list }}"
+
+    - name: Build per-host verification report
+      ansible.builtin.set_fact:
+        host_errata_report:
+          host: "{{ inventory_hostname }}"
+          applied_count: "{{ applied_list | length }}"
+          resolved_count: "{{ resolved_errata | length }}"
+          still_applicable_count: "{{ still_applicable_errata | length }}"
+          resolved_errata: "{{ resolved_errata }}"
+          still_applicable_errata: "{{ still_applicable_errata }}"
+          current_total_applicable_errata: "{{ current_errata_ids | length }}"
+          status: >-
+            {{
+              'FULLY_RESOLVED'
+              if still_applicable_errata | length == 0
+              else 'PARTIALLY_RESOLVED'
+            }}
+
+    - name: Write per-host JSON report
+      ansible.builtin.copy:
+        content: "{{ host_errata_report | to_nice_json }}"
+        dest: "/tmp/errata_verification_{{ inventory_hostname }}.json"
+      delegate_to: localhost
+
+    - name: Display summary
+      ansible.builtin.debug:
+        msg:
+          - "HOST: {{ inventory_hostname }}"
+          - "STATUS: {{ host_errata_report.status }}"
+          - "Resolved: {{ resolved_errata | length }}/{{ applied_list | length }}"
+          - "Still applicable (unexpected if any): {{ still_applicable_errata }}"
+
+- name: Combine into fleet-wide errata remediation deliverable
+  hosts: localhost
+  gather_facts: true
+  vars:
+    all_host_reports: []
+
+  tasks:
+    - name: Find all per-host errata verification reports from this run
+      ansible.builtin.find:
+        paths: /tmp
+        patterns: "errata_verification_*.json"
+        age: "-1h"
+      register: report_files
+
+    - name: Load each report
+      ansible.builtin.set_fact:
+        all_host_reports: "{{ all_host_reports + [ (lookup('file', item.path) | from_json) ] }}"
+      loop: "{{ report_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Build fleet-wide summary
+      ansible.builtin.set_fact:
+        fleet_errata_summary:
+          generated_at: "{{ ansible_date_time.iso8601 }}"
+          hosts_checked: "{{ all_host_reports | length }}"
+          hosts_fully_resolved: "{{ all_host_reports | selectattr('status', 'equalto', 'FULLY_RESOLVED') | list | length }}"
+          hosts_partially_resolved: "{{ all_host_reports | selectattr('status', 'equalto', 'PARTIALLY_RESOLVED') | list | length }}"
+          total_advisories_resolved: "{{ all_host_reports | sum(attribute='resolved_count') }}"
+          overall_status: >-
+            {{
+              'SUCCESS -- ALL APPLIED ERRATA CONFIRMED RESOLVED FLEET-WIDE'
+              if (all_host_reports | selectattr('status', 'equalto', 'PARTIALLY_RESOLVED') | list | length) == 0
+              else 'PARTIAL -- SOME HOSTS STILL SHOW APPLIED ERRATA AS APPLICABLE'
+            }}
+          hosts: "{{ all_host_reports }}"
+
+    - name: Write final fleet-wide deliverable
+      ansible.builtin.copy:
+        content: "{{ fleet_errata_summary | to_nice_json }}"
+        dest: "/tmp/fsi_errata_remediation_deliverable_{{ ansible_date_time.date }}.json"
+
+    - name: Display final summary
+      ansible.builtin.debug:
+        msg:
+          - "=== FLEET-WIDE ERRATA REMEDIATION VERIFICATION ==="
+          - "{{ fleet_errata_summary.overall_status }}"
+          - "Hosts checked: {{ fleet_errata_summary.hosts_checked }}"
+          - "Total advisories resolved: {{ fleet_errata_summary.total_advisories_resolved }}"
+          - "Full deliverable: /tmp/fsi_errata_remediation_deliverable_{{ ansible_date_time.date }}.json"
