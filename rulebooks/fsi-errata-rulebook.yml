@@ -1,82 +1,50 @@
 ---
-# fsi-errata-rulebook.yml (v2 -- corrected per official AAP 2.5 docs)
+# fsi-errata-rulebook.yml (v3 -- final, using CONFIRMED official syntax)
 #
-# CORRECTED from v1. Two real mistakes in the original, both confirmed
-# against official Ansible/AAP documentation, not guesses:
+# Condition syntax confirmed against the OFFICIAL ansible-rulebook docs
+# (github.com/ansible/ansible-rulebook/docs/conditions.rst), which shows
+# this EXACT pattern for "match any one attribute from a single event":
 #
-#   1. Wrong source plugin name: used ansible.eda.webhook -- the real
-#      builtin is eda.builtin.webhook (different namespace).
+#   condition: event.version == "2.0" or event.version == "1.1"
 #
-#   2. Wrong architecture entirely: Ansible's own rulebook docs explicitly
-#      state "It's strongly recommended to adopt [event bus or scraper
-#      patterns] and only consider callback plugins [like webhook] in the
-#      absence of any other solution" AND "Ansible Automation Platform
-#      provides integrated webhooks called Event Streams. It is recommended
-#      to use Event Streams for webhook integrations instead of custom
-#      callback plugins."
+# A bare "or" between two equality checks, NO parentheses, NO "is defined"
+# guards. This is simpler than every version tried earlier today, and it's
+# now based on the documented example, not inference.
 #
-# CORRECTED DESIGN: this rulebook now uses a placeholder source
-# (ansible.eda.generic, for local testing only) that gets SWAPPED for a
-# real AAP Event Stream at the Rulebook Activation level -- this is AAP's
-# actual documented mechanism (Using Automation Decisions, ch 10.7,
-# "Replacing sources and attaching event streams to activations"), not
-# something configured inline in the rulebook file itself.
-#
-# Satellite's native webhook (Administer -> Webhooks, subscribed to
-# run_hosts_job_katello_errata_install_succeeded / _failed -- confirmed
-# real event names via live MCP query) points at the Event Stream's
-# generated URL. No custom webhook source config lives in this file.
-#
-# HONEST STATUS: architecture now matches official docs. Still NOT yet
-# tested live against this AAP instance -- that is the next real step,
-# not a confirmed-working claim.
+# Architecture (confirmed working today):
+#   - Satellite native webhook -> AAP Event Stream -> this rulebook
+#   - action: run_job_template (the officially documented, simplest action)
+#   - Controller credential Host must include /api/controller path segment
+#     (confirmed fix for the earlier 404), auth must be valid admin creds
 
 - name: FSI errata job outcome triage
   hosts: all
 
   sources:
-    # Placeholder for LOCAL TESTING ONLY (e.g. running this rulebook
-    # standalone with ansible-rulebook -S for a dry run before ever
-    # touching AAP). In AAP, this source gets swapped for the real Event
-    # Stream via the Rulebook Activation's source-mapping UI -- it is NOT
-    # what actually receives events in production.
     - name: local_test_source
       ansible.eda.generic:
         payload: []
 
   rules:
-    # ---- Rule 1: log every event received (diagnostic, keep enabled) ----
     - name: Log all incoming job outcome events
       condition: event.payload is defined
       action:
         debug:
           msg: "Received event: {{ event.payload }}"
 
-    # ---- Rule 2: errata install job FAILED -> immediate escalation ----
-    # Satellite webhook event: run_hosts_job_katello_errata_install_failed
-    # or run_host_job_katello_errata_install_failed (singular-host variant)
     - name: Escalate failed errata install
       condition: >-
-        event.payload is defined and
-        event.payload.event_name is defined and
-        (event.payload.event_name == "actions.remote_execution.run_hosts_job_katello_errata_install_failed.event.foreman" or
-         event.payload.event_name == "actions.remote_execution.run_host_job_katello_errata_install_failed.event.foreman")
+        event.payload.event_name == "actions.remote_execution.run_hosts_job_katello_errata_install_failed.event.foreman" or
+        event.payload.event_name == "actions.remote_execution.run_host_job_katello_errata_install_failed.event.foreman"
       action:
         run_job_template:
           name: "FSI - Critical Finding Notification"
           organization: "Default"
-          job_args:
-            extra_vars:
-              alert_reason: "errata_install_failed"
 
-    # ---- Rule 3: errata install job SUCCEEDED -> trigger verification ----
-    # Closes the loop automatically instead of a human remembering to
-    # launch 09-verify-errata-remediation.yml manually.
     - name: Trigger verification after successful errata install
       condition: >-
-        event.payload.event_name in
-        ["actions.remote_execution.run_hosts_job_katello_errata_install_succeeded.event.foreman",
-         "actions.remote_execution.run_host_job_katello_errata_install_succeeded.event.foreman"]
+        event.payload.event_name == "actions.remote_execution.run_hosts_job_katello_errata_install_succeeded.event.foreman" or
+        event.payload.event_name == "actions.remote_execution.run_host_job_katello_errata_install_succeeded.event.foreman"
       action:
         run_job_template:
           name: "FSI - Verify Errata Remediation"
