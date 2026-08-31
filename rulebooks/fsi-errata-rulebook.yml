@@ -62,12 +62,11 @@
         (event.payload.event_name == "actions.remote_execution.run_hosts_job_katello_errata_install_failed.event.foreman" or
          event.payload.event_name == "actions.remote_execution.run_host_job_katello_errata_install_failed.event.foreman")
       action:
-        run_playbook:
-          name: launch-notification-via-api.yml
-          inventory: "localhost,"
-          extra_vars:
-            target_job_template_id: "{{ notification_job_template_id }}"
-            launch_extra_vars:
+        run_job_template:
+          name: "FSI - Critical Finding Notification"
+          organization: "Default"
+          job_args:
+            extra_vars:
               alert_reason: "errata_install_failed"
 
     # ---- Rule 3: errata install job SUCCEEDED -> trigger verification ----
@@ -80,8 +79,6 @@
         (event.payload.event_name == "actions.remote_execution.run_hosts_job_katello_errata_install_succeeded.event.foreman" or
          event.payload.event_name == "actions.remote_execution.run_host_job_katello_errata_install_succeeded.event.foreman")
       action:
-        run_playbook:
-          name: launch-notification-via-api.yml
-          inventory: "localhost,"
-          extra_vars:
-            target_job_template_id: "{{ verify_job_template_id }}"
+        run_job_template:
+          name: "FSI - Verify Errata Remediation"
+          organization: "Default"
