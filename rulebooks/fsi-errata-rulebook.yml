@@ -58,7 +58,8 @@
     - name: Escalate failed errata install
       condition: >-
         event.payload is defined and
-        "katello_errata_install_failed" in (event.payload.event_name | default(''))
+        event.payload.event_name is defined and
+        event.payload.event_name == "actions.remote_execution.run_hosts_job_katello_errata_install_failed.event.foreman"
       action:
         run_job_template:
           name: "FSI - Critical Finding Notification"
@@ -74,7 +75,8 @@
     - name: Trigger verification after successful errata install
       condition: >-
         event.payload is defined and
-        "katello_errata_install_succeeded" in (event.payload.event_name | default(''))
+        event.payload.event_name is defined and
+        event.payload.event_name == "actions.remote_execution.run_hosts_job_katello_errata_install_succeeded.event.foreman"
       action:
         run_job_template:
           name: "FSI - Verify Errata Remediation"
