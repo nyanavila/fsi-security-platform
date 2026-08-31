@@ -1,0 +1,39 @@
+---
+# critical-finding-notification.yml
+#
+# Small alert playbook for the "FSI - Critical Finding Notification" Job
+# Template. Triggered by the EDA rulebook's "Escalate failed errata
+# install" rule when a katello_errata_install job fails.
+#
+# HONEST STATUS: uses ansible.builtin.debug as a placeholder alert
+# mechanism. Real Slack/email notification requires either the
+# community.general.slack module (needs a webhook URL you configure) or
+# an AAP Notification Template attached to this Job Template's own
+# notifications config (the more idiomatic AAP way -- notifications don't
+# need to be playbook tasks at all, they can be configured on the Job
+# Template itself in AAP's UI). This playbook exists so the rulebook has
+# something real to call; wire up the actual Slack/email delivery
+# mechanism as a follow-up, not guessed at here.
+
+- name: Alert on critical/failed finding
+  hosts: localhost
+  gather_facts: true
+
+  tasks:
+    - name: Log the alert (placeholder -- see header note for real notification setup)
+      ansible.builtin.debug:
+        msg:
+          - "=== FSI CRITICAL FINDING ALERT ==="
+          - "Reason: {{ alert_reason | default('unspecified') }}"
+          - "Raw event: {{ raw_event | default('not provided') }}"
+          - "Time: {{ ansible_date_time.iso8601 }}"
+          - "ACTION NEEDED: review this finding in Satellite/AAP directly."
+
+    - name: Write the alert to a durable file (so it's visible in job output/artifacts)
+      ansible.builtin.copy:
+        content: |
+          FSI Critical Finding Alert
+          Generated: {{ ansible_date_time.iso8601 }}
+          Reason: {{ alert_reason | default('unspecified') }}
+          Raw event: {{ raw_event | default('not provided') }}
+        dest: "/tmp/critical_finding_alert_{{ ansible_date_time.date }}_{{ ansible_date_time.time | replace(':','') }}.txt"
