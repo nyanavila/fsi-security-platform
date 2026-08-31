@@ -1,164 +1,84 @@
 ---
-# fsi-errata-rulebook.yml
+# fsi-errata-rulebook.yml (v2 -- corrected per official AAP 2.5 docs)
 #
-# EDA rulebook for Stage 2 (Operate) of the three-stage lifecycle design.
-# Receives errata-finding events from 07b-check-errata-and-notify-eda.yml
-# (run on an AAP Schedule) and branches by severity:
+# CORRECTED from v1. Two real mistakes in the original, both confirmed
+# against official Ansible/AAP documentation, not guesses:
 #
-#   Critical findings  -> immediate Slack/email escalation (does NOT
-#                          auto-launch remediation, even via approval --
-#                          matches the "wake someone up" path from the
-#                          CVE remediation workflow design)
-#   Important findings -> launches the "FSI - Apply Errata" Job Template
-#                          scoped to "important" severity, which AAP's own
-#                          Workflow Approval Node in front of it still gates
-#                          (this rulebook triggers the WORKFLOW, not the
-#                          bare remediation job directly -- the human
-#                          approval step lives in the AAP Workflow Template,
-#                          not here)
+#   1. Wrong source plugin name: used ansible.eda.webhook -- the real
+#      builtin is eda.builtin.webhook (different namespace).
 #
-# HONEST STATUS: this is the first EDA rulebook written this entire
-# session -- genuinely untested. The ansible.eda.webhook source and
-# run_job_template action are real, documented ansible.eda collection
-# components, but their exact behavior against THIS AAP instance has not
-# been confirmed live. Test this incrementally: first confirm the webhook
-# receives events at all (a rule that just logs/prints), before trusting
-# the run_job_template action to actually fire correctly.
+#   2. Wrong architecture entirely: Ansible's own rulebook docs explicitly
+#      state "It's strongly recommended to adopt [event bus or scraper
+#      patterns] and only consider callback plugins [like webhook] in the
+#      absence of any other solution" AND "Ansible Automation Platform
+#      provides integrated webhooks called Event Streams. It is recommended
+#      to use Event Streams for webhook integrations instead of custom
+#      callback plugins."
+#
+# CORRECTED DESIGN: this rulebook now uses a placeholder source
+# (ansible.eda.generic, for local testing only) that gets SWAPPED for a
+# real AAP Event Stream at the Rulebook Activation level -- this is AAP's
+# actual documented mechanism (Using Automation Decisions, ch 10.7,
+# "Replacing sources and attaching event streams to activations"), not
+# something configured inline in the rulebook file itself.
+#
+# Satellite's native webhook (Administer -> Webhooks, subscribed to
+# run_hosts_job_katello_errata_install_succeeded / _failed -- confirmed
+# real event names via live MCP query) points at the Event Stream's
+# generated URL. No custom webhook source config lives in this file.
+#
+# HONEST STATUS: architecture now matches official docs. Still NOT yet
+# tested live against this AAP instance -- that is the next real step,
+# not a confirmed-working claim.
 
-- name: FSI errata severity triage
+- name: FSI errata job outcome triage
   hosts: all
 
   sources:
-    - ansible.eda.webhook:
-        host: 0.0.0.0
-        port: 5000
+    # Placeholder for LOCAL TESTING ONLY (e.g. running this rulebook
+    # standalone with ansible-rulebook -S for a dry run before ever
+    # touching AAP). In AAP, this source gets swapped for the real Event
+    # Stream via the Rulebook Activation's source-mapping UI -- it is NOT
+    # what actually receives events in production.
+    - name: local_test_source
+      ansible.eda.generic:
+        payload: []
 
   rules:
     # ---- Rule 1: log every event received (diagnostic, keep enabled) ----
-    - name: Log all incoming errata events
-      condition: event.payload.event_type == "errata_finding"
+    - name: Log all incoming job outcome events
+      condition: event.payload is defined
       action:
         debug:
-          msg: >-
-            Received errata event for {{ event.payload.host }}:
-            {{ event.payload.critical_count }} Critical,
-            {{ event.payload.important_count }} Important
+          msg: "Received event: {{ event.payload }}"
 
-    # ---- Rule 2: Critical findings -> immediate human escalation ----
-    - name: Escalate critical findings immediately
-      condition: event.payload.critical_count > 0
+    # ---- Rule 2: errata install job FAILED -> immediate escalation ----
+    # Satellite webhook event: run_hosts_job_katello_errata_install_failed
+    # or run_host_job_katello_errata_install_failed (singular-host variant)
+    - name: Escalate failed errata install
+      condition: >-
+        event.payload is defined and
+        "katello_errata_install_failed" in (event.payload.event_name | default(''))
       action:
         run_job_template:
           name: "FSI - Critical Finding Notification"
           organization: "Default"
           job_args:
             extra_vars:
-              host: "{{ event.payload.host }}"
-              critical_errata_ids: "{{ event.payload.critical_errata_ids }}"
-              severity: "critical"
+              alert_reason: "errata_install_failed"
+              raw_event: "{{ event.payload }}"
 
-    # ---- Rule 3: Important findings -> trigger the approval-gated
-    #      remediation workflow (NOT direct remediation -- the workflow's
-    #      own Approval Node is still the real gate) ----
-    - name: Trigger approval-gated remediation workflow for important findings
-      condition: event.payload.important_count > 0 and event.payload.critical_count == 0
+    # ---- Rule 3: errata install job SUCCEEDED -> trigger verification ----
+    # Closes the loop automatically instead of a human remembering to
+    # launch 09-verify-errata-remediation.yml manually.
+    - name: Trigger verification after successful errata install
+      condition: >-
+        event.payload is defined and
+        "katello_errata_install_succeeded" in (event.payload.event_name | default(''))
       action:
-        run_workflow_template:
-          name: "FSI Errata Remediation Loop - With Approval"
+        run_job_template:
+          name: "FSI - Verify Errata Remediation"
           organization: "Default"
           job_args:
             extra_vars:
-              host: "{{ event.payload.host }}"
-              important_errata_ids: "{{ event.payload.important_errata_ids }}"
-              errata_severity_filter: "important"
-
-# EDA Setup -- FSI Errata Severity Triage
-
-First real use of EDA this entire session. Honest status: **untested**.
-Everything else in this repo has been proven against a live AAP/Satellite
-instance today; this has not. Test incrementally per the notes below.
-
-## Design choice: webhook, not a Satellite polling source plugin
-
-Satellite has no native EDA source plugin and no push/webhook mechanism
-for errata events. Rather than write a custom EDA source plugin (a bigger,
-riskier lift to get right blind), this design uses the **inverse**: an AAP
-**Scheduled Job Template** runs `07b-check-errata-and-notify-eda.yml`
-periodically, and IT pushes an event to EDA's webhook when something
-urgent is found. EDA then does the severity-based branching from there.
-
-This reuses AAP Scheduling (a real, stable AAP feature) instead of
-betting on unverified EDA-Satellite integration code.
-
-## Setup steps
-
-### 1. Create the Rulebook Activation in AAP
-
-- **Resources -> Rulebook Activations -> Add**
-- Name: `FSI Errata Severity Triage`
-- Project: point at wherever you push `fsi-errata-rulebook.yml`
-  (add it to the `fsi-security-platform` repo, e.g. under `eda/`)
-- Rulebook: `fsi-errata-rulebook.yml`
-- Decision Environment: use AAP's default, or a custom one if you've
-  built one
-- Restart Policy: `always` (so it survives AAP restarts)
-
-### 2. Confirm the webhook is reachable
-
-Once activated, AAP will show the activation's actual listening address
-(check the activation's detail page). Note this URL -- it's what
-`07b`'s `eda_webhook_url` variable needs to point at.
-
-### 3. Test the webhook receives events BEFORE trusting the branching logic
-
-```bash
-curl -X POST http://<eda-activation-host>:5000/endpoint \
-  -H "Content-Type: application/json" \
-  -d '{"event_type": "errata_finding", "host": "test-host", "critical_count": 0, "important_count": 2, "important_errata_ids": ["RHSA-2026:99999"]}'
-```
-
-Check the Rulebook Activation's logs in AAP -- you should see "Log all
-incoming errata events" fire. **Do this before relying on Rule 2/3
-actually launching anything** -- confirm the plumbing works with the
-harmless logging rule first.
-
-### 4. Create the two AAP resources the rulebook's actions reference
-
-Neither of these exists yet -- create them before the rulebook can
-actually do anything beyond logging:
-
-- **Job Template**: `FSI - Critical Finding Notification` -- a simple
-  playbook that sends a Slack/email alert (not yet written; the rulebook
-  references it by name, but the actual notification playbook is a small
-  follow-up build)
-- **Workflow Template**: `FSI Errata Remediation Loop - With Approval` --
-  same pattern as the OpenSCAP compliance workflow already built (Check
-  Errata -> Approval Node -> Apply Errata -> Verify), just for the errata
-  chain instead
-
-### 5. Set up the AAP Schedule for 07b
-
-- **Resources -> Templates -> [Job Template running 07b] -> Schedules -> Add**
-- Interval: every 15-30 minutes (adjust based on how time-sensitive you
-  want detection to be vs. API load)
-- Variables:
-  ```yaml
-  satellite_user: admin
-  satellite_password: FsiDemo2026x
-  eda_webhook_url: "http://<confirmed-eda-activation-address>:5000/endpoint"
-  ```
-
-## What to verify, in order, before calling this done
-
-1. Webhook receives a manually-curled test event (step 3 above)
-2. `07b` run manually (not yet scheduled) successfully POSTs a real event
-   when a host genuinely has Critical/Important findings
-3. The logging rule fires on that real event
-4. Create the two missing AAP resources (step 4)
-5. Only then enable Rules 2/3 for real and confirm they actually launch
-   the right template/workflow
-6. Only then turn on the Schedule for unattended, continuous operation
-
-Do not skip to step 6 -- every other automated piece built today that
-worked reliably got there by verifying each layer before trusting the
-next one.
+              raw_event: "{{ event.payload }}"
