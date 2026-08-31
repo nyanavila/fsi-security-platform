@@ -74,10 +74,9 @@
     # launch 09-verify-errata-remediation.yml manually.
     - name: Trigger verification after successful errata install
       condition: >-
-        event.payload is defined and
-        event.payload.event_name is defined and
-        (event.payload.event_name == "actions.remote_execution.run_hosts_job_katello_errata_install_succeeded.event.foreman" or
-         event.payload.event_name == "actions.remote_execution.run_host_job_katello_errata_install_succeeded.event.foreman")
+        event.payload.event_name in
+        ["actions.remote_execution.run_hosts_job_katello_errata_install_succeeded.event.foreman",
+         "actions.remote_execution.run_host_job_katello_errata_install_succeeded.event.foreman"]
       action:
         run_job_template:
           name: "FSI - Verify Errata Remediation"
