@@ -64,6 +64,7 @@
       action:
         run_playbook:
           name: launch-notification-via-api.yml
+          inventory: "localhost,"
           extra_vars:
             target_job_template_id: "{{ notification_job_template_id }}"
             launch_extra_vars:
@@ -81,5 +82,6 @@
       action:
         run_playbook:
           name: launch-notification-via-api.yml
+          inventory: "localhost,"
           extra_vars:
             target_job_template_id: "{{ verify_job_template_id }}"
