@@ -1,0 +1,164 @@
+---
+# fsi-errata-rulebook.yml
+#
+# EDA rulebook for Stage 2 (Operate) of the three-stage lifecycle design.
+# Receives errata-finding events from 07b-check-errata-and-notify-eda.yml
+# (run on an AAP Schedule) and branches by severity:
+#
+#   Critical findings  -> immediate Slack/email escalation (does NOT
+#                          auto-launch remediation, even via approval --
+#                          matches the "wake someone up" path from the
+#                          CVE remediation workflow design)
+#   Important findings -> launches the "FSI - Apply Errata" Job Template
+#                          scoped to "important" severity, which AAP's own
+#                          Workflow Approval Node in front of it still gates
+#                          (this rulebook triggers the WORKFLOW, not the
+#                          bare remediation job directly -- the human
+#                          approval step lives in the AAP Workflow Template,
+#                          not here)
+#
+# HONEST STATUS: this is the first EDA rulebook written this entire
+# session -- genuinely untested. The ansible.eda.webhook source and
+# run_job_template action are real, documented ansible.eda collection
+# components, but their exact behavior against THIS AAP instance has not
+# been confirmed live. Test this incrementally: first confirm the webhook
+# receives events at all (a rule that just logs/prints), before trusting
+# the run_job_template action to actually fire correctly.
+
+- name: FSI errata severity triage
+  hosts: all
+
+  sources:
+    - ansible.eda.webhook:
+        host: 0.0.0.0
+        port: 5000
+
+  rules:
+    # ---- Rule 1: log every event received (diagnostic, keep enabled) ----
+    - name: Log all incoming errata events
+      condition: event.payload.event_type == "errata_finding"
+      action:
+        debug:
+          msg: >-
+            Received errata event for {{ event.payload.host }}:
+            {{ event.payload.critical_count }} Critical,
+            {{ event.payload.important_count }} Important
+
+    # ---- Rule 2: Critical findings -> immediate human escalation ----
+    - name: Escalate critical findings immediately
+      condition: event.payload.critical_count > 0
+      action:
+        run_job_template:
+          name: "FSI - Critical Finding Notification"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              host: "{{ event.payload.host }}"
+              critical_errata_ids: "{{ event.payload.critical_errata_ids }}"
+              severity: "critical"
+
+    # ---- Rule 3: Important findings -> trigger the approval-gated
+    #      remediation workflow (NOT direct remediation -- the workflow's
+    #      own Approval Node is still the real gate) ----
+    - name: Trigger approval-gated remediation workflow for important findings
+      condition: event.payload.important_count > 0 and event.payload.critical_count == 0
+      action:
+        run_workflow_template:
+          name: "FSI Errata Remediation Loop - With Approval"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              host: "{{ event.payload.host }}"
+              important_errata_ids: "{{ event.payload.important_errata_ids }}"
+              errata_severity_filter: "important"
+
+# EDA Setup -- FSI Errata Severity Triage
+
+First real use of EDA this entire session. Honest status: **untested**.
+Everything else in this repo has been proven against a live AAP/Satellite
+instance today; this has not. Test incrementally per the notes below.
+
+## Design choice: webhook, not a Satellite polling source plugin
+
+Satellite has no native EDA source plugin and no push/webhook mechanism
+for errata events. Rather than write a custom EDA source plugin (a bigger,
+riskier lift to get right blind), this design uses the **inverse**: an AAP
+**Scheduled Job Template** runs `07b-check-errata-and-notify-eda.yml`
+periodically, and IT pushes an event to EDA's webhook when something
+urgent is found. EDA then does the severity-based branching from there.
+
+This reuses AAP Scheduling (a real, stable AAP feature) instead of
+betting on unverified EDA-Satellite integration code.
+
+## Setup steps
+
+### 1. Create the Rulebook Activation in AAP
+
+- **Resources -> Rulebook Activations -> Add**
+- Name: `FSI Errata Severity Triage`
+- Project: point at wherever you push `fsi-errata-rulebook.yml`
+  (add it to the `fsi-security-platform` repo, e.g. under `eda/`)
+- Rulebook: `fsi-errata-rulebook.yml`
+- Decision Environment: use AAP's default, or a custom one if you've
+  built one
+- Restart Policy: `always` (so it survives AAP restarts)
+
+### 2. Confirm the webhook is reachable
+
+Once activated, AAP will show the activation's actual listening address
+(check the activation's detail page). Note this URL -- it's what
+`07b`'s `eda_webhook_url` variable needs to point at.
+
+### 3. Test the webhook receives events BEFORE trusting the branching logic
+
+```bash
+curl -X POST http://<eda-activation-host>:5000/endpoint \
+  -H "Content-Type: application/json" \
+  -d '{"event_type": "errata_finding", "host": "test-host", "critical_count": 0, "important_count": 2, "important_errata_ids": ["RHSA-2026:99999"]}'
+```
+
+Check the Rulebook Activation's logs in AAP -- you should see "Log all
+incoming errata events" fire. **Do this before relying on Rule 2/3
+actually launching anything** -- confirm the plumbing works with the
+harmless logging rule first.
+
+### 4. Create the two AAP resources the rulebook's actions reference
+
+Neither of these exists yet -- create them before the rulebook can
+actually do anything beyond logging:
+
+- **Job Template**: `FSI - Critical Finding Notification` -- a simple
+  playbook that sends a Slack/email alert (not yet written; the rulebook
+  references it by name, but the actual notification playbook is a small
+  follow-up build)
+- **Workflow Template**: `FSI Errata Remediation Loop - With Approval` --
+  same pattern as the OpenSCAP compliance workflow already built (Check
+  Errata -> Approval Node -> Apply Errata -> Verify), just for the errata
+  chain instead
+
+### 5. Set up the AAP Schedule for 07b
+
+- **Resources -> Templates -> [Job Template running 07b] -> Schedules -> Add**
+- Interval: every 15-30 minutes (adjust based on how time-sensitive you
+  want detection to be vs. API load)
+- Variables:
+  ```yaml
+  satellite_user: admin
+  satellite_password: FsiDemo2026x
+  eda_webhook_url: "http://<confirmed-eda-activation-address>:5000/endpoint"
+  ```
+
+## What to verify, in order, before calling this done
+
+1. Webhook receives a manually-curled test event (step 3 above)
+2. `07b` run manually (not yet scheduled) successfully POSTs a real event
+   when a host genuinely has Critical/Important findings
+3. The logging rule fires on that real event
+4. Create the two missing AAP resources (step 4)
+5. Only then enable Rules 2/3 for real and confirm they actually launch
+   the right template/workflow
+6. Only then turn on the Schedule for unattended, continuous operation
+
+Do not skip to step 6 -- every other automated piece built today that
+worked reliably got there by verifying each layer before trusting the
+next one.
