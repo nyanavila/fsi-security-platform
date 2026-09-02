@@ -1,51 +1,72 @@
 ---
-# fsi-errata-rulebook.yml (v3 -- final, using CONFIRMED official syntax)
+# fsi-errata-rulebook.yml (v4 -- testing the merged-rule hypothesis)
 #
-# Condition syntax confirmed against the OFFICIAL ansible-rulebook docs
-# (github.com/ansible/ansible-rulebook/docs/conditions.rst), which shows
-# this EXACT pattern for "match any one attribute from a single event":
+# HONEST STATUS: this is an engineering hypothesis to test empirically, not
+# a confirmed fix. No matching upstream ansible-rulebook GitHub issue was
+# found -- official docs state multiple rules SHOULD each fire independently
+# on the same event, so the behavior we captured (two rules both activate,
+# only one dispatches its action) is genuinely anomalous, not documented.
 #
-#   condition: event.version == "2.0" or event.version == "1.1"
+# HYPOTHESIS: the bug manifests specifically when two separate rules both
+# activate on the same event (the broad "is defined" catch-all + a specific
+# condition, both matching one "succeeded" event). This version removes
+# that exact circumstance by merging the logging debug action and the
+# run_job_template action into ONE rule with a multi-action list -- a
+# normal, documented rulebook pattern (actions: as a list), not exotic.
 #
-# A bare "or" between two equality checks, NO parentheses, NO "is defined"
-# guards. This is simpler than every version tried earlier today, and it's
-# now based on the documented example, not inference.
+# TEST PROCEDURE: deploy this, fire a real errata-install event, then check
+# the activation logs for a "Creating action task action::run_job_template::..."
+# line. If it appears, the hypothesis holds and this is the fix. If it still
+# doesn't appear, the bug is NOT specifically about rule co-activation and
+# this hypothesis is ruled out -- go to the AAP Workflow Template fallback
+# instead (see README.md).
 #
-# Architecture (confirmed working today):
-#   - Satellite native webhook -> AAP Event Stream -> this rulebook
-#   - action: run_job_template (the officially documented, simplest action)
-#   - Controller credential Host must include /api/controller path segment
-#     (confirmed fix for the earlier 404), auth must be valid admin creds
+# The still-live "FSI Errata Job Outcome Triage v2" activation (activation
+# id 2) remains the last CONFIRMED-architecture-correct baseline. Test this
+# v4 file as a NEW, separate activation first -- don't overwrite v2 until
+# this is proven, so you can revert cleanly if the hypothesis is wrong.
 
-- name: FSI errata job outcome triage
+- name: FSI errata job outcome triage (merged actions test)
   hosts: all
 
   sources:
     - name: local_test_source
       ansible.eda.generic:
         payload: []
+        # NOTE: replace this via the Rulebook Activation's source-mapping UI
+        # with the real Event Stream (fsi-errata-outcomes) -- this is a
+        # placeholder for local dry-runs only, same as v2/v3.
 
   rules:
-    - name: Log all incoming job outcome events
-      condition: event.payload is defined
-      action:
-        debug:
-          msg: "Received event: {{ event.payload }}"
-
-    - name: Escalate failed errata install
+    - name: Handle failed errata install
       condition: >-
         event.payload.event_name == "actions.remote_execution.run_hosts_job_katello_errata_install_failed.event.foreman" or
         event.payload.event_name == "actions.remote_execution.run_host_job_katello_errata_install_failed.event.foreman"
-      action:
-        run_job_template:
-          name: "FSI - Critical Finding Notification"
-          organization: "Default"
+      actions:
+        - debug:
+            msg: "FAILED errata install: {{ event.payload }}"
+        - run_job_template:
+            name: "FSI - Critical Finding Notification"
+            organization: "Default"
 
-    - name: Trigger verification after successful errata install
+    - name: Handle successful errata install
       condition: >-
         event.payload.event_name == "actions.remote_execution.run_hosts_job_katello_errata_install_succeeded.event.foreman" or
         event.payload.event_name == "actions.remote_execution.run_host_job_katello_errata_install_succeeded.event.foreman"
+      actions:
+        - debug:
+            msg: "SUCCEEDED errata install: {{ event.payload }}"
+        - run_job_template:
+            name: "FSI - Verify Errata Remediation"
+            organization: "Default"
+
+    - name: Log anything else (catch-all, no longer overlaps with the two rules above)
+      condition: >-
+        event.payload is defined and
+        event.payload.event_name != "actions.remote_execution.run_hosts_job_katello_errata_install_failed.event.foreman" and
+        event.payload.event_name != "actions.remote_execution.run_host_job_katello_errata_install_failed.event.foreman" and
+        event.payload.event_name != "actions.remote_execution.run_hosts_job_katello_errata_install_succeeded.event.foreman" and
+        event.payload.event_name != "actions.remote_execution.run_host_job_katello_errata_install_succeeded.event.foreman"
       action:
-        run_job_template:
-          name: "FSI - Verify Errata Remediation"
-          organization: "Default"
+        debug:
+          msg: "Other event received: {{ event.payload }}"
