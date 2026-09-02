@@ -1,36 +1,38 @@
 ---
-# 09-verify-errata-remediation.yml
+# 09-verify-errata-remediation.yml (v2 -- simplified, robust design)
 #
-# Errata equivalent of 06-verify-remediation.yml. Re-checks applicable
-# errata per host after 08-apply-errata.yml ran, and produces a fleet-wide
-# JSON deliverable proving which advisories were resolved.
+# REPLACES the v1 design, which compared a manually-provided or
+# host-parameter-auto-discovered list of specific advisory IDs against
+# current applicable errata. CONFIRMED via live query today: the
+# fsi_last_applied_errata host parameter write in 08-apply-errata.yml
+# never actually worked (verified: does not exist on any host, host or
+# inherited scope) -- so that auto-discovery path was silently dead the
+# whole time, and the manual fallback required a human to correctly
+# re-type the exact advisory batch every single verification run.
 #
-# Does NOT trigger a rescan (unlike 06) -- errata applicability in Satellite
-# updates as soon as the package database refreshes post-install, no
-# separate OpenSCAP-style scan job is needed. Just re-query and compare.
+# THE SIMPLER, CONFIRMED-ROBUST FIX: don't track "did these SPECIFIC
+# advisories get resolved" at all. Just check "does this host currently
+# have ZERO applicable security errata." This is what actually matters
+# for the security posture question, it needs no tracking mechanism, no
+# host parameter, no human re-entry -- and it was validated live today:
+# querying a host's errata_counts.security field directly gave an
+# immediate, clear, correct answer (0, down from 46) with zero setup.
 #
-# Usage: pass the SAME errata_severity_filter and the same advisory list
-# you applied in 08, OR simply pass previously_applied_errata as an explicit
-# comma-separated list (safer -- avoids re-deriving "what severity tier did
-# we apply" from scratch, since severity buckets can shift between runs as
-# new advisories appear, per the real finding just confirmed today).
+# Trade-off, stated honestly: this reports "still has known security
+# errata outstanding" vs "fully caught up on security errata" -- it does
+# NOT report on the fate of one specific historical batch. If you
+# genuinely need "did batch X specifically get resolved" (e.g. for an
+# audit trail of one remediation event), that needs a different,
+# purpose-built tracking mechanism -- this playbook answers the more
+# common and more actionable question instead.
 
-- name: Verify errata remediation per host
+- name: Verify security errata status per host
   hosts: all
   gather_facts: false
   vars:
     satellite_url: "https://ip-10-0-1-135.us-east-2.compute.internal"
 
   tasks:
-    - name: Validate required variables
-      ansible.builtin.assert:
-        that:
-          - previously_applied_errata is defined
-        fail_msg: >-
-          This playbook needs: previously_applied_errata (comma-separated
-          advisory IDs that were applied in 08, e.g.
-          "RHSA-2026:56133,RHSA-2026:56131")
-
     - name: Look up this host's Satellite host ID
       ansible.builtin.uri:
         url: "{{ satellite_url }}/api/hosts?search=name%3D%22{{ inventory_hostname }}%22"
@@ -47,42 +49,39 @@
       ansible.builtin.meta: end_host
       when: host_lookup.json.results | length == 0
 
-    - name: Re-query current applicable errata
+    - name: Get current errata counts for this host
       ansible.builtin.uri:
-        url: "{{ satellite_url }}/api/hosts/{{ host_lookup.json.results[0].id }}/errata"
+        url: "{{ satellite_url }}/api/hosts/{{ host_lookup.json.results[0].id }}"
         method: GET
         user: "{{ satellite_user }}"
         password: "{{ satellite_password }}"
         force_basic_auth: true
         validate_certs: false
         status_code: [200]
-      register: current_errata
+      register: host_detail
 
-    - name: Set current applicable IDs as a fact
+    - name: Set errata count facts
+      # CONFIRMED live: content_facet_attributes.errata_counts.security is
+      # the correct, real path -- verified against an actual host record.
       ansible.builtin.set_fact:
-        current_errata_ids: "{{ current_errata.json.results | default([]) | map(attribute='errata_id') | list }}"
-        applied_list: "{{ previously_applied_errata.split(',') }}"
-
-    - name: Determine which applied advisories are confirmed resolved vs still present
-      ansible.builtin.set_fact:
-        resolved_errata: "{{ applied_list | reject('in', current_errata_ids) | list }}"
-        still_applicable_errata: "{{ applied_list | select('in', current_errata_ids) | list }}"
+        security_errata_count: "{{ host_detail.json.content_facet_attributes.errata_counts.security | default(0) }}"
+        bugfix_errata_count: "{{ host_detail.json.content_facet_attributes.errata_counts.bugfix | default(0) }}"
+        total_errata_count: "{{ host_detail.json.content_facet_attributes.errata_counts.total | default(0) }}"
 
     - name: Build per-host verification report
       ansible.builtin.set_fact:
         host_errata_report:
           host: "{{ inventory_hostname }}"
-          applied_count: "{{ applied_list | length }}"
-          resolved_count: "{{ resolved_errata | length }}"
-          still_applicable_count: "{{ still_applicable_errata | length }}"
-          resolved_errata: "{{ resolved_errata }}"
-          still_applicable_errata: "{{ still_applicable_errata }}"
-          current_total_applicable_errata: "{{ current_errata_ids | length }}"
+          satellite_host_id: "{{ host_lookup.json.results[0].id }}"
+          checked_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          security_errata_remaining: "{{ security_errata_count }}"
+          bugfix_errata_remaining: "{{ bugfix_errata_count }}"
+          total_errata_remaining: "{{ total_errata_count }}"
           status: >-
             {{
-              'FULLY_RESOLVED'
-              if still_applicable_errata | length == 0
-              else 'PARTIALLY_RESOLVED'
+              'CLEAN -- NO SECURITY ERRATA OUTSTANDING'
+              if security_errata_count | int == 0
+              else 'SECURITY ERRATA STILL OUTSTANDING'
             }}
 
     - name: Write per-host JSON report
@@ -96,10 +95,10 @@
         msg:
           - "HOST: {{ inventory_hostname }}"
           - "STATUS: {{ host_errata_report.status }}"
-          - "Resolved: {{ resolved_errata | length }}/{{ applied_list | length }}"
-          - "Still applicable (unexpected if any): {{ still_applicable_errata }}"
+          - "Security errata remaining: {{ security_errata_count }}"
+          - "Bugfix errata remaining (informational, not security-relevant): {{ bugfix_errata_count }}"
 
-- name: Combine into fleet-wide errata remediation deliverable
+- name: Combine into fleet-wide security errata status deliverable
   hosts: localhost
   gather_facts: true
   vars:
@@ -122,30 +121,31 @@
 
     - name: Build fleet-wide summary
       ansible.builtin.set_fact:
-        fleet_errata_summary:
+        fleet_summary:
           generated_at: "{{ ansible_date_time.iso8601 }}"
           hosts_checked: "{{ all_host_reports | length }}"
-          hosts_fully_resolved: "{{ all_host_reports | selectattr('status', 'equalto', 'FULLY_RESOLVED') | list | length }}"
-          hosts_partially_resolved: "{{ all_host_reports | selectattr('status', 'equalto', 'PARTIALLY_RESOLVED') | list | length }}"
-          total_advisories_resolved: "{{ all_host_reports | sum(attribute='resolved_count') }}"
+          hosts_clean: "{{ all_host_reports | selectattr('status', 'equalto', 'CLEAN -- NO SECURITY ERRATA OUTSTANDING') | list | length }}"
+          hosts_with_security_errata: "{{ all_host_reports | selectattr('status', 'equalto', 'SECURITY ERRATA STILL OUTSTANDING') | list | length }}"
+          total_security_errata_outstanding_fleet_wide: "{{ all_host_reports | sum(attribute='security_errata_remaining') }}"
           overall_status: >-
             {{
-              'SUCCESS -- ALL APPLIED ERRATA CONFIRMED RESOLVED FLEET-WIDE'
-              if (all_host_reports | selectattr('status', 'equalto', 'PARTIALLY_RESOLVED') | list | length) == 0
-              else 'PARTIAL -- SOME HOSTS STILL SHOW APPLIED ERRATA AS APPLICABLE'
+              'SUCCESS -- FLEET HAS ZERO OUTSTANDING SECURITY ERRATA'
+              if (all_host_reports | selectattr('status', 'equalto', 'SECURITY ERRATA STILL OUTSTANDING') | list | length) == 0
+              else 'ATTENTION -- SOME HOSTS HAVE OUTSTANDING SECURITY ERRATA'
             }}
           hosts: "{{ all_host_reports }}"
 
     - name: Write final fleet-wide deliverable
       ansible.builtin.copy:
-        content: "{{ fleet_errata_summary | to_nice_json }}"
-        dest: "/tmp/fsi_errata_remediation_deliverable_{{ ansible_date_time.date }}.json"
+        content: "{{ fleet_summary | to_nice_json }}"
+        dest: "/tmp/fsi_security_errata_status_{{ ansible_date_time.date }}.json"
 
     - name: Display final summary
       ansible.builtin.debug:
         msg:
-          - "=== FLEET-WIDE ERRATA REMEDIATION VERIFICATION ==="
-          - "{{ fleet_errata_summary.overall_status }}"
-          - "Hosts checked: {{ fleet_errata_summary.hosts_checked }}"
-          - "Total advisories resolved: {{ fleet_errata_summary.total_advisories_resolved }}"
-          - "Full deliverable: /tmp/fsi_errata_remediation_deliverable_{{ ansible_date_time.date }}.json"
+          - "=== FLEET-WIDE SECURITY ERRATA STATUS ==="
+          - "{{ fleet_summary.overall_status }}"
+          - "Hosts checked: {{ fleet_summary.hosts_checked }}"
+          - "Hosts clean: {{ fleet_summary.hosts_clean }}"
+          - "Hosts with outstanding security errata: {{ fleet_summary.hosts_with_security_errata }}"
+          - "Full deliverable: /tmp/fsi_security_errata_status_{{ ansible_date_time.date }}.json"
