@@ -35,8 +35,13 @@
         satellite_host_id: "{{ host_lookup.json.results[0].id }}"
 
     - name: Query applicable errata for this host
+      # FIXED: bare call defaulted to per_page=20, sorted by updated desc --
+      # confirmed live to silently truncate hosts with >20 total errata,
+      # hiding older (but still real) security advisories behind newer
+      # bugfix/enhancement entries. This bug was confirmed to cause a real
+      # missed remediation in 08-apply-errata.yml's identical call pattern.
       ansible.builtin.uri:
-        url: "{{ satellite_url }}/api/hosts/{{ satellite_host_id }}/errata"
+        url: "{{ satellite_url }}/api/hosts/{{ satellite_host_id }}/errata?per_page=200"
         method: GET
         user: "{{ satellite_user }}"
         password: "{{ satellite_password }}"
@@ -44,6 +49,15 @@
         validate_certs: false
         status_code: [200]
       register: errata_result
+
+    - name: Warn loudly if even 200 isn't enough to capture everything
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: this host has {{ errata_result.json.total }} total
+          applicable errata, exceeding the per_page=200 fetched here.
+          Results are STILL TRUNCATED. Raise per_page further or implement
+          real pagination.
+      when: errata_result.json.total | default(0) | int > 200
 
     - name: Set errata facts, categorized by severity
       ansible.builtin.set_fact:
