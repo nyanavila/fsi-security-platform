@@ -57,8 +57,13 @@
     - name: Re-query applicable errata directly (self-sufficient -- does NOT
         depend on 07's output file, since AAP job runs are ephemeral
         containers and files don't persist between separate job launches)
+      # FIXED: bare call defaulted to per_page=20, sorted by updated desc --
+      # CONFIRMED this caused a real missed remediation on ip-10-0-2-44:
+      # the 14 real security errata (older updated_at) fell past page 1,
+      # entirely invisible to this task, while only bugfix/enhancement
+      # entries (more recently updated) came back in the truncated page.
       ansible.builtin.uri:
-        url: "{{ satellite_url }}/api/hosts/{{ satellite_host_id }}/errata"
+        url: "{{ satellite_url }}/api/hosts/{{ satellite_host_id }}/errata?per_page=200"
         method: GET
         user: "{{ satellite_user }}"
         password: "{{ satellite_password }}"
@@ -66,6 +71,15 @@
         validate_certs: false
         status_code: [200]
       register: errata_result
+
+    - name: Warn loudly if even 200 isn't enough to capture everything
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: this host has {{ errata_result.json.total }} total
+          applicable errata, exceeding the per_page=200 fetched here.
+          Results are STILL TRUNCATED -- do not trust advisories_to_apply
+          below until this is fixed with real pagination.
+      when: errata_result.json.total | default(0) | int > 200
 
     - name: Set errata facts, categorized by severity
       ansible.builtin.set_fact:
@@ -115,6 +129,44 @@
               errata: "{{ advisories_to_apply | join(',') }}"
         status_code: [200, 201]
       register: errata_job
+
+    - name: Record what was applied as a durable Satellite host parameter
+      # NOT YET LIVE-VERIFIED against this Satellite version's exact API --
+      # this is the standard, documented Foreman host-parameters pattern.
+      # Confirm via MCP before relying on this in production: ask it to
+      # check the real params for POST /api/hosts/:id/parameters.
+      # Purpose: 09-verify-errata-remediation.yml can read this back
+      # directly from Satellite instead of needing a human to re-type the
+      # advisory list into a Survey field -- fixes the "ephemeral /tmp,
+      # manual re-entry" gap flagged in SURVEYS.md.
+      ansible.builtin.uri:
+        url: "{{ satellite_url }}/api/hosts/{{ satellite_host_id }}/parameters"
+        method: POST
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          parameter:
+            name: "fsi_last_applied_errata"
+            value: "{{ advisories_to_apply | join(',') }}"
+        status_code: [200, 201, 422]  # 422 tolerated: parameter may already exist, needs PUT instead -- see note
+      register: param_write_result
+      delegate_to: localhost
+      ignore_errors: true  # do not fail the whole remediation job over this recording step
+
+    - name: Warn if the durable-record write failed (remediation itself still succeeded)
+      ansible.builtin.debug:
+        msg: >-
+          NOTE: recording the applied-errata list as a Satellite host
+          parameter did not succeed (status {{ param_write_result.status | default('unknown') }}).
+          The actual errata install above still completed -- this only
+          affects whether 09-verify-errata-remediation.yml can auto-discover
+          what was applied. Fall back to passing previously_applied_errata
+          manually to 09, or fix this write (may need PUT instead of POST
+          if the parameter already exists from a prior run).
+      when: param_write_result.status | default(0) not in [200, 201]
 
     - name: Confirm
       ansible.builtin.debug:
